@@ -10,6 +10,14 @@ Veles runs entirely on CPU — no GPU, no transformer forward pass at query time
 
 Originally inspired by [Semble](https://github.com/MinishLab/semble) — Veles started as a Rust port of the same hybrid retrieval recipe and has grown to add persistent + incremental indexing, tree-sitter `symbols` / `defs` / `refs`, six pipe-friendly output formats, glob/language filters, gRPC, and shell completions.
 
+<p align="center">
+  <img src=".assets/tui-demo.gif" alt="Veles TUI — live hybrid search with preview pane" width="900">
+</p>
+
+<p align="center">
+  <sub><code>veles tui</code> — live hybrid search, ~10ms per keystroke. <a href=".assets/tui-demo.mp4">MP4 version</a></sub>
+</p>
+
 ## Interfaces
 
 - **CLI** — `veles search "query" ./my-repo`
@@ -109,6 +117,19 @@ veles update .             # incremental refresh
 veles status .             # manifest + drift
 veles clean .              # remove .veles/
 ```
+
+### Interactive TUI
+
+```sh
+veles tui                          # live hybrid search with preview pane
+veles tui ./my-repo                # against another repo
+```
+
+Loads the persistent index once, then debounces queries so each keystroke
+re-runs in tens of milliseconds. `↑↓` navigate, `Tab` cycles
+hybrid/bm25/semantic, `Ctrl-R` finds related code, `Enter` prints
+`path:line` to stdout (`$EDITOR $(veles tui)` works), `Ctrl-O` opens in
+`$EDITOR`, `?` shows the full keybinding overlay.
 
 ### Servers
 
