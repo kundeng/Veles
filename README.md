@@ -1,6 +1,6 @@
 # Veles
 
-Fast local code search for AI agents. Pure Rust
+Fast local code search for AI agents written in pure Rust
 
 Inspired by [Semble](https://github.com/MinishLab/semble), Veles is a Rust reimplementation of the same hybrid retrieval approach. It uses the same [potion](https://huggingface.co/minishlab) static embedding models via [model2vec-rs](https://github.com/MinishLab/model2vec-rs) - no transformer forward pass at query time, everything runs in milliseconds on CPU.
 
