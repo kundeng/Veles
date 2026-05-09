@@ -1,50 +1,32 @@
 [workspace]
 members = ["cargo:."]
 
-# cargo-dist configuration. See https://opensource.axo.dev/cargo-dist/.
+# Config for 'dist'
 [dist]
-# Pin to the cargo-dist version used to generate the release workflow.
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
-
-# CI backend.
+# CI backends to support
 ci = "github"
-
-# Installers generated alongside the platform tarballs.
-# - shell:      `curl … | sh` for Linux / macOS
-# - powershell: `irm … | iex`  for Windows
-#
-# `homebrew` is intentionally omitted until the `julymetodiev/homebrew-veles`
-# tap repo + `HOMEBREW_TAP_TOKEN` secret are set up. Re-add it to enable
-# auto-publish of the formula.
-installers = ["shell", "powershell"]
-
-# Target triples to build for.
-#
-# Linux uses gnu (glibc) rather than musl: tokenizers/esaxx-rs has C++
-# code that needs `*-linux-musl-g++`, which isn't on the default GitHub
-# Actions runner. gnu builds work out of the box but need glibc 2.31+
-# on the host (Ubuntu 20.04+, Debian 11+, RHEL 8+, etc.). Users on
-# Alpine or other musl distros can `cargo install veles-cli`.
-targets = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-]
-
-# Publish jobs run after the release artifacts are uploaded.
-# `./publish-crates` is a custom workflow that pushes the four library
-# crates (in dependency order) to crates.io. The job is idempotent —
-# already-published versions are skipped, so re-running on the same tag
-# is safe.
-publish-jobs = ["./publish-crates"]
-
-# On pull requests, only run `dist plan` (validates config without
-# building). Full multi-platform builds run only on tag push.
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "julymetodiev/homebrew-tap"
+# Customize the Homebrew formula name
+formula = "veles-cli"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Publish jobs to run in CI.
+# - `homebrew`         — auto-publishes the formula to `tap` after release
+# - `./publish-crates` — custom workflow that pushes the four library
+#                        crates to crates.io in dependency order
+publish-jobs = ["homebrew", "./publish-crates"]
+# Which actions to run on pull requests
 pr-run-mode = "plan"
-
-# Always include source archives in releases.
+# Generate and dist a source tarball
 source-tarball = true
-
-# Generate per-platform checksum files alongside the artifacts.
+# Checksums to generate for each App
 checksum = "sha256"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
