@@ -1,0 +1,24 @@
+[package]
+name = "veles-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core library for Veles code search — indexing, chunking, BM25, dense search, and hybrid ranking"
+
+[dependencies]
+model2vec-rs = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+tracing = { workspace = true }
+tempfile = "3"
+ahash = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
