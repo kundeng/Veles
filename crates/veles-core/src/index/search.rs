@@ -11,6 +11,18 @@ use crate::types::{Chunk, SearchMode, SearchResult};
 
 const RRF_K: f64 = 60.0;
 
+/// Common short-circuit guard for all three search modes.
+///
+/// An empty index, a `top_k` of zero, or a query that's only whitespace
+/// would all produce meaningless results — we'd waste an embedding pass
+/// and (for semantic / hybrid) return arbitrary chunks ranked against
+/// the embedding of `""`. Returning `Vec::new()` early keeps the public
+/// behaviour consistent with `VelesIndex::search`'s own outer guard.
+#[inline]
+fn should_skip_search(query: &str, top_k: usize, chunks: &[Chunk]) -> bool {
+    chunks.is_empty() || top_k == 0 || query.trim().is_empty()
+}
+
 /// Convert an ordered `(idx, raw_score)` ranking into RRF scores.
 ///
 /// `out[idx] = 1 / (RRF_K + rank + 1)` for each ranked entry; remaining slots stay 0.0.
@@ -31,6 +43,9 @@ pub fn search_semantic(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    if should_skip_search(query, top_k, chunks) {
+        return Vec::new();
+    }
     let query_embedding = model.encode(&[query.to_string()]);
     let query_vec = &query_embedding[0];
     let (indices, similarities) = dense_index.query(query_vec, top_k, selector);
@@ -54,8 +69,13 @@ pub fn search_bm25(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    if should_skip_search(query, top_k, chunks) {
+        return Vec::new();
+    }
     let tokens = tokenize(query);
     if tokens.is_empty() {
+        // Non-whitespace query that still yields no tokens (e.g. all
+        // punctuation) — BM25 has nothing to score against, so bail out.
         return Vec::new();
     }
     let results = bm25_index.top_k(&tokens, top_k, selector);
@@ -81,7 +101,7 @@ pub fn search_hybrid(
     alpha: Option<f64>,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
-    if chunks.is_empty() || top_k == 0 {
+    if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
     let alpha_weight = resolve_alpha(query, alpha);
@@ -149,5 +169,41 @@ mod tests {
         assert!(out[2] > out[0]); // higher raw score → lower rank → higher RRF
         assert_eq!(out[1], 0.0);
         assert_eq!(out[3], 0.0);
+    }
+
+    fn dummy_chunk() -> Chunk {
+        Chunk {
+            content: "fn foo() {}".to_string(),
+            file_path: "test.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            language: Some("rust".to_string()),
+        }
+    }
+
+    #[test]
+    fn skip_when_chunks_empty() {
+        let none: Vec<Chunk> = Vec::new();
+        assert!(should_skip_search("anything", 5, &none));
+    }
+
+    #[test]
+    fn skip_when_top_k_zero() {
+        let chunks = vec![dummy_chunk()];
+        assert!(should_skip_search("anything", 0, &chunks));
+    }
+
+    #[test]
+    fn skip_when_query_blank() {
+        let chunks = vec![dummy_chunk()];
+        assert!(should_skip_search("", 5, &chunks));
+        assert!(should_skip_search("   ", 5, &chunks));
+        assert!(should_skip_search("\t\n", 5, &chunks));
+    }
+
+    #[test]
+    fn proceed_with_real_inputs() {
+        let chunks = vec![dummy_chunk()];
+        assert!(!should_skip_search("hello", 5, &chunks));
     }
 }
