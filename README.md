@@ -212,10 +212,6 @@ The persistent index lives under `<repo>/.veles/`:
 
 `update` reuses embeddings of files whose `(size, mtime)` fingerprint hasn't changed, so refreshing after a small edit is near-instant on large repos.
 
-## Acknowledgments
-
-Veles owes its initial design to [Semble](https://github.com/MinishLab/semble) and uses the same [potion](https://huggingface.co/minishlab) static-embedding models via [model2vec-rs](https://github.com/MinishLab/model2vec-rs). Many thanks to the [MinishLab](https://github.com/MinishLab) team.
-
 ## License
 
 MIT
