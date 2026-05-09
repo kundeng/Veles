@@ -441,12 +441,28 @@ impl VelesIndex {
     }
 
     /// Return chunks semantically similar to the given chunk.
-    pub fn find_related(&self, source: &Chunk, top_k: usize) -> Vec<SearchResult> {
-        let selector = source
-            .language
-            .as_ref()
-            .and_then(|lang| self.language_mapping.get(lang))
-            .map(|v| v.as_slice());
+    ///
+    /// When neither `filter_languages` nor `filter_paths` is supplied, the
+    /// search is restricted to chunks in the same language as `source` —
+    /// the historical default ("show me semantically similar Rust code
+    /// given a Rust starting point"). Pass an explicit empty slice
+    /// (`Some(&[])`) on either filter to opt out of that default.
+    pub fn find_related(
+        &self,
+        source: &Chunk,
+        top_k: usize,
+        filter_languages: Option<&[String]>,
+        filter_paths: Option<&[String]>,
+    ) -> Vec<SearchResult> {
+        let selector: Option<Vec<usize>> = if filter_languages.is_none() && filter_paths.is_none() {
+            source
+                .language
+                .as_ref()
+                .and_then(|lang| self.language_mapping.get(lang))
+                .cloned()
+        } else {
+            self.get_selector_vector(filter_languages, filter_paths)
+        };
 
         let results = search_semantic(
             &source.content,
@@ -454,7 +470,7 @@ impl VelesIndex {
             &self.dense_index,
             &self.chunks,
             top_k + 1,
-            selector,
+            selector.as_deref(),
         );
 
         results
