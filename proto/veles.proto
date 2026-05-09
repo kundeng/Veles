@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package veles;
+
+// ── Messages ──────────────────────────────────────────────────────────────
+
+message Chunk {
+  string content = 1;
+  string file_path = 2;
+  int32 start_line = 3;
+  int32 end_line = 4;
+  optional string language = 5;
+}
+
+message SearchResult {
+  Chunk chunk = 1;
+  double score = 2;
+  string source = 3; // "hybrid" | "semantic" | "bm25"
+}
+
+message IndexStats {
+  int32 indexed_files = 1;
+  int32 total_chunks = 2;
+  map<string, int32> languages = 3;
+}
+
+// ── Search ────────────────────────────────────────────────────────────────
+
+message SearchRequest {
+  string query = 1;
+  string repo = 2; // local path or https:// git URL
+  optional string ref = 3; // git branch/tag
+  int32 top_k = 4;
+  string mode = 5; // "hybrid" | "semantic" | "bm25"
+  optional double alpha = 6;
+  repeated string filter_languages = 7;
+  repeated string filter_paths = 8;
+  bool include_text_files = 9;
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+}
+
+// ── Find Related ──────────────────────────────────────────────────────────
+
+message FindRelatedRequest {
+  string file_path = 1;
+  int32 line = 2;
+  string repo = 3;
+  optional string ref = 4;
+  int32 top_k = 5;
+  bool include_text_files = 6;
+}
+
+message FindRelatedResponse {
+  repeated SearchResult results = 1;
+}
+
+// ── Index ─────────────────────────────────────────────────────────────────
+
+message IndexRequest {
+  string repo = 1; // local path or https:// git URL
+  optional string ref = 2;
+  bool include_text_files = 3;
+}
+
+message IndexResponse {
+  IndexStats stats = 1;
+}
+
+// ── Get Stats ─────────────────────────────────────────────────────────────
+
+message GetStatsRequest {
+  string repo = 1;
+}
+
+message GetStatsResponse {
+  IndexStats stats = 1;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────
+
+service VelesService {
+  // Index a repo (local path or git URL).  Idempotent — a repo is only
+  // re-indexed if it is not already cached.
+  rpc Index(IndexRequest) returns (IndexResponse);
+
+  // Search an indexed repo with a natural-language or code query.
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Find chunks semantically similar to a given file + line.
+  rpc FindRelated(FindRelatedRequest) returns (FindRelatedResponse);
+
+  // Return stats for a cached index.
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+}
