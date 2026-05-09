@@ -95,7 +95,7 @@ fn worker_loop(index: Arc<VelesIndex>, cmd_rx: Receiver<WorkerCmd>, msg_tx: Send
             WorkerCmd::Related { seq, source, top_k } => {
                 let started = Instant::now();
                 let anchor = format!("{}:{}", source.file_path, source.start_line);
-                let results = index.find_related(&source, top_k);
+                let results = index.find_related(&source, top_k, None, None);
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let _ = msg_tx.send(WorkerMsg::SearchDone(SearchDone {
                     seq,

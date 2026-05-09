@@ -261,7 +261,7 @@ fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "find_related".into(),
-            description: "Find code chunks semantically similar to a specific location in a file. Use after `search` to explore related implementations or callers.".into(),
+            description: "Find code chunks semantically similar to a specific location in a file. Use after `search` to explore related implementations or callers. Defaults to the source chunk's language; pass `lang` / `path` / `exclude` to override.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -281,6 +281,21 @@ fn tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Number of similar chunks to return.",
                         "default": 5
+                    },
+                    "lang": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict results to these languages. Overrides the default (same language as the source chunk)."
+                    },
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to include (e.g. ['src/**/*.rs'])."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to exclude (e.g. ['tests/**'])."
                     },
                     "format": {
                         "type": "string",
@@ -648,7 +663,25 @@ impl McpServer {
                 .then(a.start_line.cmp(&b.start_line))
         });
 
-        let bm25_hits = index.search(name, top_k, SearchMode::Bm25, None, None, None);
+        // Pull a few extra BM25 hits so that dropping chunks that overlap a
+        // definition site still leaves the caller with roughly the requested
+        // count. Two-thirds extra is enough for most realistic queries
+        // without ballooning the round-trip.
+        let bm25_overshoot = top_k + (top_k / 2).max(1);
+        let bm25_hits: Vec<veles_core::types::SearchResult> = index
+            .search(name, bm25_overshoot, SearchMode::Bm25, None, None, None)
+            .into_iter()
+            .filter(|hit| {
+                // Drop hits whose chunk *contains* a definition's start line —
+                // those are the same code the def section already pointed at.
+                !defs.iter().any(|d| {
+                    d.file_path == hit.chunk.file_path
+                        && d.start_line >= hit.chunk.start_line
+                        && d.start_line <= hit.chunk.end_line
+                })
+            })
+            .take(top_k)
+            .collect();
 
         if defs.is_empty() && bm25_hits.is_empty() {
             return Ok(json!({
@@ -815,6 +848,9 @@ impl McpServer {
         let repo = args["repo"].as_str().unwrap_or(".");
         let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
         let format = args["format"].as_str().unwrap_or("default");
+        let lang = string_array(&args, "lang");
+        let path_globs = string_array(&args, "path");
+        let exclude_globs = string_array(&args, "exclude");
 
         let mut cache = self.cache.lock().await;
         let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
@@ -830,7 +866,17 @@ impl McpServer {
             })?
             .clone();
 
-        let results = index.find_related(&chunk, top_k);
+        let glob_paths =
+            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+                JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                }
+            })?;
+        let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
+        let path_slice: Option<&[String]> = glob_paths.as_deref();
+
+        let results = index.find_related(&chunk, top_k, lang_slice, path_slice);
 
         if results.is_empty() {
             return Ok(json!({

@@ -83,7 +83,7 @@ pub fn handle_find_related(
         }
     };
 
-    let mut results = index.find_related(&chunk, top_k);
+    let mut results = index.find_related(&chunk, top_k, None, None);
     if let Some(threshold) = min_score {
         results.retain(|r| r.score >= threshold);
     }

@@ -226,7 +226,7 @@ impl VelesService for VelesServiceImpl {
             })?
             .clone();
 
-        let results = index.find_related(&chunk, top_k);
+        let results = index.find_related(&chunk, top_k, None, None);
 
         Ok(Response::new(FindRelatedResponse {
             results: results.into_iter().map(convert_result).collect(),
