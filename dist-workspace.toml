@@ -18,13 +18,17 @@ ci = "github"
 # auto-publish of the formula.
 installers = ["shell", "powershell"]
 
-# Target triples to build for. Linux uses musl so the binary is statically
-# linked and runs on any glibc / musl distribution.
+# Target triples to build for.
+#
+# Linux uses gnu (glibc) rather than musl: tokenizers/esaxx-rs has C++
+# code that needs `*-linux-musl-g++`, which isn't on the default GitHub
+# Actions runner. gnu builds work out of the box but need glibc 2.31+
+# on the host (Ubuntu 20.04+, Debian 11+, RHEL 8+, etc.). Users on
+# Alpine or other musl distros can `cargo install veles-cli`.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "aarch64-unknown-linux-musl",
-    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ]
 
