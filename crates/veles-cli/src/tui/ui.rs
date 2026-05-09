@@ -274,7 +274,10 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let end = (app.list_offset + viewport).min(app.results.len());
 
-    let path_col = (inner.width as usize).saturating_sub(8 + 2 + 1).min(60); // budget for path
+    // Give trailing text (scope label / snippet) more room: cap path
+    // padding at 40 cols rather than 60 so the right-hand label isn't
+    // squeezed to nothing on terminals split 42/58 with a preview pane.
+    let path_col = (inner.width as usize).saturating_sub(8 + 2 + 1).min(40); // budget for path
     let mut lines: Vec<Line> = Vec::with_capacity(end - app.list_offset);
     for idx in app.list_offset..end {
         let r = &app.results[idx];
@@ -287,10 +290,19 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         );
         let path_text = pad_or_truncate(&path_text, path_col);
         let score_text = format!("{:>5.3}", r.score);
-        let snippet = first_nonblank_line(&r.chunk.content);
-        let snippet_max = (inner.width as usize)
+
+        // Prefer the tree-sitter scope label (`defines `Foo`` / `in `bar``)
+        // when available — it's a more reliable "what is this" signal than
+        // the chunk's first non-blank line. Fall back to the snippet when
+        // the chunk doesn't sit inside any recognised symbol.
+        let scope_label = veles_core::scope::chunk_scope_label(app.index.symbols(), &r.chunk);
+        let (trailing_text, trailing_is_scope) = match scope_label {
+            Some(label) => (label, true),
+            None => (first_nonblank_line(&r.chunk.content).to_string(), false),
+        };
+        let trailing_max = (inner.width as usize)
             .saturating_sub(arrow.len() + path_text.len() + score_text.len() + 4);
-        let snippet = truncate(snippet, snippet_max);
+        let trailing = truncate(&trailing_text, trailing_max);
 
         let row_style = |s: Style| -> Style {
             match row_bg {
@@ -322,9 +334,17 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
             ),
         ));
         spans.push(Span::styled("  ".to_string(), row_style(Style::default())));
+        // Scope labels render in a slightly brighter colour than raw
+        // code snippets so the metadata stands out at a glance. Italic
+        // is intentionally avoided — many terminals don't render it.
+        let trailing_style = if trailing_is_scope {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(FAINT)
+        };
         spans.push(Span::styled(
-            snippet.to_string(),
-            row_style(Style::default().fg(FAINT)),
+            trailing.to_string(),
+            row_style(trailing_style),
         ));
 
         // Pad rest of the line with spaces so the row-bg fills the row.
