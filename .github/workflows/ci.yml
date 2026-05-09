@@ -1,12 +1,13 @@
-# Pull-request validation: fmt + clippy + test on Linux and macOS.
-# Tag-based releases are handled by .github/workflows/release.yml.
+# Tag-only CI: fmt + clippy + test run alongside the release pipeline so
+# every published version has its lint + test run logged. The release
+# build itself (release.yml) does its own `cargo` invocation, but this
+# adds the rustfmt / clippy gates that release.yml does not run.
 
 name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
 
 # Cancel in-progress runs when a new commit lands on the same ref.
 concurrency:

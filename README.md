@@ -34,15 +34,26 @@ Originally inspired by [Semble](https://github.com/MinishLab/semble) — Veles s
 ## Install
 
 ```sh
-# Linux / macOS — prebuilt binary
+# Linux / macOS — prebuilt binary (one-liner)
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/julymetodiev/Veles/releases/latest/download/veles-cli-installer.sh | sh
 
+# Windows — PowerShell
+irm https://github.com/julymetodiev/Veles/releases/latest/download/veles-cli-installer.ps1 | iex
+
 # From crates.io (compiles locally; no protoc / extra deps needed)
 cargo install veles-cli
+
+# Manual download
+gh release download --repo julymetodiev/Veles --pattern '*linux-gnu*'   # or browse
+#   https://github.com/julymetodiev/Veles/releases/latest
+
+# Verify (optional)
+veles --version    # → veles 0.1.4
 ```
 
-See **[INSTALL.md](INSTALL.md)** for Windows, manual download, and verification.
+See **[INSTALL.md](INSTALL.md)** for SHA-256 verification and other
+install paths.
 
 ## Quickstart
 
