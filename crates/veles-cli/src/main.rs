@@ -14,6 +14,7 @@ mod cli;
 mod format;
 mod handlers;
 mod output;
+mod tui;
 mod util;
 
 use anyhow::Result;
@@ -118,6 +119,13 @@ async fn main() -> Result<()> {
             format,
             multilingual,
         }) => handlers::handle_refs(name, path, top_k, format, multilingual),
+
+        Some(Commands::Tui {
+            path,
+            multilingual,
+            include_text_files,
+            no_cache,
+        }) => handlers::handle_tui(path, multilingual, include_text_files, no_cache),
 
         Some(Commands::Completions { shell }) => handlers::handle_completions(shell),
 

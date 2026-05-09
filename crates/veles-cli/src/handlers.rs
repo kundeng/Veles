@@ -381,6 +381,15 @@ fn write_or_fall_through(rendered: &str) {
     }
 }
 
+pub fn handle_tui(
+    path: String,
+    multilingual: bool,
+    include_text_files: bool,
+    no_cache: bool,
+) -> Result<()> {
+    crate::tui::run(path, multilingual, include_text_files, !no_cache)
+}
+
 pub async fn handle_serve_grpc(addr: String) -> Result<()> {
     let mdl = model::load_model(None)?;
     veles_grpc::serve(&addr, mdl).await?;

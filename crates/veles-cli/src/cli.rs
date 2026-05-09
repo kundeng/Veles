@@ -215,6 +215,32 @@ pub enum Commands {
         multilingual: bool,
     },
 
+    /// Launch the interactive terminal UI for live hybrid search.
+    ///
+    /// Loads the persistent index once, then debounces queries so each
+    /// keystroke re-runs in tens of milliseconds. Arrow keys navigate the
+    /// hit list, Tab cycles through hybrid/bm25/semantic, Enter opens the
+    /// selected result in $EDITOR, Ctrl-R finds related code, ? shows
+    /// keybindings.
+    ///
+    /// Examples:
+    ///   veles tui
+    ///   veles tui ./my-repo --multilingual
+    Tui {
+        /// Local path of the indexed repo (default: current directory).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Use the multilingual embedding model (must match how the index was built).
+        #[arg(long)]
+        multilingual: bool,
+        /// Also index non-code text files when building the index from scratch.
+        #[arg(long)]
+        include_text_files: bool,
+        /// Force a fresh in-memory build, ignoring any `.veles/` cache.
+        #[arg(long)]
+        no_cache: bool,
+    },
+
     /// Print a shell completion script to stdout.
     ///
     /// Examples:
