@@ -421,11 +421,67 @@ pub fn handle_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_man() -> Result<()> {
+pub fn handle_man(out_dir: Option<PathBuf>) -> Result<()> {
     let cmd = Cli::command();
-    let man = clap_mangen::Man::new(cmd);
-    man.render(&mut std::io::stdout())
-        .context("render man page")?;
+    match out_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            let written = write_man_pages(cmd, &dir, None)?;
+            eprintln!("Wrote {written} man page(s) to {}", dir.display());
+        }
+        None => {
+            let man = clap_mangen::Man::new(cmd);
+            man.render(&mut std::io::stdout())
+                .context("render man page")?;
+        }
+    }
     Ok(())
+}
+
+/// Recursively write `veles.1`, `veles-<sub>.1`, `veles-<sub>-<subsub>.1`
+/// into `dir`. Returns the number of pages written.
+fn write_man_pages(
+    cmd: clap::Command,
+    dir: &std::path::Path,
+    parent_name: Option<&str>,
+) -> Result<usize> {
+    use std::fs::File;
+
+    let leaf_name = cmd.get_name();
+    let full_name = match parent_name {
+        Some(parent) => format!("{parent}-{leaf_name}"),
+        None => leaf_name.to_string(),
+    };
+
+    let mut written = 1;
+    let path = dir.join(format!("{full_name}.1"));
+    let mut file = File::create(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+
+    // Render with the full name in `.TH` so the page header reads
+    // `veles-search(1)` instead of just `search(1)`.
+    // clap's `Command::name` wants `impl Into<Str>` where `Str` is roughly
+    // `Cow<'static, str>`. The cheapest way to materialise a runtime
+    // `&'static str` is `Box::leak` — the cost is one allocation per page
+    // (a handful of pages per `--out-dir` invocation, never repeated).
+    let full_name_static: &'static str = Box::leak(full_name.clone().into_boxed_str());
+    let renamed = cmd
+        .clone()
+        .name(full_name_static)
+        .bin_name(full_name_static);
+    clap_mangen::Man::new(renamed)
+        .render(&mut file)
+        .with_context(|| format!("render {}", path.display()))?;
+
+    for sub in cmd.get_subcommands() {
+        // Skip the auto-generated `help` subcommand — it has no useful
+        // page of its own and clutters MANPATH.
+        if sub.get_name() == "help" {
+            continue;
+        }
+        written += write_man_pages(sub.clone(), dir, Some(&full_name))?;
+    }
+    Ok(written)
 }
 

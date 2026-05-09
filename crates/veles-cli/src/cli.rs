@@ -10,6 +10,27 @@ use clap_complete::Shell;
 #[derive(Parser)]
 #[command(name = "veles")]
 #[command(about = "Fast and Accurate Code Search for Agents")]
+#[command(long_about = "\
+Veles is a fast hybrid (BM25 + semantic) local code search engine for AI \
+agents and humans. It runs entirely on CPU using static embeddings via \
+model2vec-rs, maintains a persistent on-disk index under <repo>/.veles/, \
+and exposes its functionality through a CLI, an MCP stdio server, and a \
+gRPC service.
+
+Typical workflow:
+
+  veles index .                      # build & save the index
+  veles search 'parse config file'   # hybrid search reuses the cache
+  veles update .                     # incremental refresh after edits
+
+Symbol-aware lookups (Rust, Python, JavaScript, TypeScript, Go):
+
+  veles symbols src/main.rs          # outline a single file
+  veles defs Manifest                # find every definition
+  veles refs save_index              # defs + BM25 references
+
+Output formats: pretty (default), compact, ripgrep, paths, json, jsonl.
+Run `veles <SUBCOMMAND> --help` for per-subcommand details.")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -206,10 +227,20 @@ pub enum Commands {
         shell: Shell,
     },
 
-    /// Print a roff(7) man page to stdout (suitable for `/usr/local/share/man/man1/veles.1`).
+    /// Generate roff(7) man pages.
+    ///
+    /// With no flag, prints just the top-level `veles.1` to stdout.
+    /// With `--out-dir`, writes one page per subcommand
+    /// (`veles.1`, `veles-search.1`, `veles-defs.1`, ...) so that
+    /// `man veles-search` resolves correctly, like git's man layout.
     ///
     /// Examples:
     ///   veles man > veles.1
-    ///   veles man | gzip > /usr/local/share/man/man1/veles.1.gz
-    Man,
+    ///   veles man --out-dir ~/.local/share/man/man1
+    Man {
+        /// Write a `veles.1` plus one `veles-<sub>.1` per subcommand
+        /// into this directory. The directory is created if needed.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<std::path::PathBuf>,
+    },
 }

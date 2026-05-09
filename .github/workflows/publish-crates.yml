@@ -45,24 +45,28 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          # Skip-or-publish: query crates.io's HTTP API for the (crate, version)
-          # tuple. 200 OK → already published, skip. 404 → publish.
-          publish_if_new() {
+          # Run `cargo publish`. If it succeeds, great. If it fails with
+          # "already exists" / "already uploaded" — the version is already
+          # on crates.io — treat as success. Any other failure aborts.
+          publish_or_skip() {
             local crate="$1"
-            local version
-            version=$(cargo pkgid -p "$crate" | sed -E 's/.*[#@]//')
-            if curl -sf -o /dev/null \
-                "https://crates.io/api/v1/crates/${crate}/${version}"; then
-              echo "✓ ${crate} ${version} already on crates.io — skipping"
+            local out rc
+            echo "→ cargo publish -p ${crate}"
+            out=$(cargo publish -p "${crate}" 2>&1) && rc=0 || rc=$?
+            echo "${out}"
+            if [ "${rc}" -eq 0 ]; then
+              echo "✓ published ${crate}"
+            elif echo "${out}" | grep -qE "(already exists on|already uploaded)"; then
+              echo "✓ ${crate} already on crates.io — skipping"
             else
-              echo "→ Publishing ${crate} ${version}"
-              cargo publish -p "${crate}"
+              echo "✗ unexpected failure (exit ${rc})"
+              return "${rc}"
             fi
           }
 
-          publish_if_new veles-core
-          publish_if_new veles-grpc
-          publish_if_new veles-mcp
-          publish_if_new veles-cli
+          publish_or_skip veles-core
+          publish_or_skip veles-grpc
+          publish_or_skip veles-mcp
+          publish_or_skip veles-cli

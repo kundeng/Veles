@@ -451,23 +451,30 @@ veles completions elvish > ~/.config/elvish/lib/veles.elv
 # Then in rc.elv: use veles
 ```
 
-### Man page
+### Man pages
+
+`veles man --out-dir DIR` writes one page per subcommand —
+`veles.1`, `veles-search.1`, `veles-defs.1`, `veles-update.1`, etc.
+This is the same layout `git` ships, so `man veles-search` resolves
+just like `man git-commit`.
 
 ```sh
 # Project-local install (no sudo):
 mkdir -p ~/.local/share/man/man1
-veles man > ~/.local/share/man/man1/veles.1
-# Make sure ~/.local/share/man is on $MANPATH.
+veles man --out-dir ~/.local/share/man/man1
+# Make sure ~/.local/share/man is on $MANPATH:
+echo 'export MANPATH="$HOME/.local/share/man:$MANPATH"' >> ~/.zshrc
 
 # System-wide (Linux):
-veles man | sudo tee /usr/local/share/man/man1/veles.1 >/dev/null
+sudo veles man --out-dir /usr/local/share/man/man1
 
-# View it:
-man veles
+# View
+man veles            # top-level overview
+man veles-search     # detailed flags for `veles search`
 ```
 
-The top-level page lists every subcommand. For per-subcommand
-help, use `veles <subcommand> --help`.
+For just the top-level page (legacy single-file install), pass no
+flag — it prints to stdout: `veles man > veles.1`.
 
 ## Troubleshooting
 

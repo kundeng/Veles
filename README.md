@@ -107,8 +107,12 @@ veles serve-grpc --addr "[::1]:50051"          # gRPC
 ```sh
 mkdir -p ~/.zfunc ~/.local/share/man/man1
 veles completions zsh > ~/.zfunc/_veles
-veles man              > ~/.local/share/man/man1/veles.1
+veles man --out-dir ~/.local/share/man/man1
 ```
+
+`veles man --out-dir DIR` writes one page per subcommand (`veles.1`,
+`veles-search.1`, `veles-defs.1`, …) so `man veles-search` works the
+same way as `man git-commit`.
 
 Then once in `~/.zshrc`:
 

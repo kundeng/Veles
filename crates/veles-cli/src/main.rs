@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
 
         Some(Commands::Completions { shell }) => handlers::handle_completions(shell),
 
-        Some(Commands::Man) => handlers::handle_man(),
+        Some(Commands::Man { out_dir }) => handlers::handle_man(out_dir),
 
         Some(Commands::ServeGrpc { addr }) => handlers::handle_serve_grpc(addr).await,
 
