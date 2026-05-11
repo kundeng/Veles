@@ -306,6 +306,132 @@ fn tools() -> Vec<Tool> {
                 "required": ["file_path", "line"]
             }),
         },
+        Tool {
+            name: "list_symbols".into(),
+            description: "List tree-sitter definitions across the index with optional filters by kind, language, and path globs. Unlike `defs` (which requires an exact name) this is the exploration tool — answer questions like 'every struct in crates/foo/' or 'all public functions in Python files'. Returns `kind name (lang) — file:line` per match, sorted by path then start line.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Restrict to a single symbol kind (e.g. 'function', 'struct', 'class', 'enum', 'trait', 'method', 'const')."
+                    },
+                    "lang": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to these languages (e.g. ['rust', 'python'])."
+                    },
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to include (e.g. ['crates/**/src/**/*.rs'])."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to exclude (e.g. ['tests/**'])."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of symbols to return. Default 200; raise for full-repo enumerations.",
+                        "default": 200
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "files".into(),
+            description: "List distinct file paths known to the index, with optional language and path-glob filters. Use to orient yourself in an unfamiliar repo or to feed downstream tools that expect a file shortlist. Returns one path per line, sorted alphabetically.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    },
+                    "lang": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to files in these languages (matched against the chunk's tree-sitter language tag — 'rust', 'python', 'javascript', 'typescript', 'go', etc.)."
+                    },
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to include (e.g. ['src/**/*.rs'])."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to exclude."
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "scope_at".into(),
+            description: "Return the innermost tree-sitter symbol whose range contains the given file:line. Use to answer 'which function / struct does this line live in?' without scanning the whole file's symbol list. Returns symbol kind, name, language, and start/end lines.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file as stored in the index (relative to `repo`)."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Line number (1-indexed)."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    }
+                },
+                "required": ["file_path", "line"]
+            }),
+        },
+        Tool {
+            name: "read".into(),
+            description: "Read a line range from a file in the indexed repo. Resolves `file_path` against the repo root, refuses paths that escape the repo (no '..' or absolute paths), and caps each call at 500 lines. Use when you already know the location (e.g. from `defs`, `search`, or `scope_at`) and want the actual source bytes. Local repos only.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file relative to the repo root (no leading '/' or '..')."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to include (1-indexed)."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to include (1-indexed, inclusive). Capped at start_line + 499."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path. Git URLs are not supported — clone locally and pass the path."
+                    }
+                },
+                "required": ["file_path", "start_line", "end_line"]
+            }),
+        },
+        Tool {
+            name: "status".into(),
+            description: "Non-mutating drift check: compare the persisted `.veles/manifest.json` against the current state of disk and report file counts (added / modified / removed). Useful before deciding whether to call `update`. Local repos only.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path."
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -500,6 +626,11 @@ impl McpServer {
             "refs" => self.handle_refs(arguments).await,
             "stats" => self.handle_stats(arguments).await,
             "update" => self.handle_update(arguments).await,
+            "list_symbols" => self.handle_list_symbols(arguments).await,
+            "files" => self.handle_files(arguments).await,
+            "scope_at" => self.handle_scope_at(arguments).await,
+            "read" => self.handle_read(arguments).await,
+            "status" => self.handle_status(arguments).await,
             _ => Err(JsonRpcError {
                 code: -32602,
                 message: format!("Unknown tool: {tool_name}"),
@@ -850,6 +981,394 @@ impl McpServer {
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_list_symbols(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let repo = args["repo"].as_str().unwrap_or(".");
+        let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
+        let lang = string_array(&args, "lang");
+        let path_globs = string_array(&args, "path");
+        let exclude_globs = string_array(&args, "exclude");
+        let limit = args["limit"].as_u64().unwrap_or(200) as usize;
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        // Resolve globs against the index's known file set. None means
+        // no glob filter; Some(empty) is impossible since `resolve_path_filter`
+        // errors when nothing matches.
+        let glob_paths =
+            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+                JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                }
+            })?;
+        let path_set: Option<std::collections::HashSet<&str>> = glob_paths
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let mut hits: Vec<&Symbol> = index
+            .symbols()
+            .iter()
+            .filter(|s| match &kind_filter {
+                Some(k) => s.kind.as_str() == k,
+                None => true,
+            })
+            .filter(|s| lang.is_empty() || lang.iter().any(|l| l == &s.language))
+            .filter(|s| match &path_set {
+                Some(set) => set.contains(s.file_path.as_str()),
+                None => true,
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+        });
+
+        if hits.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": "No symbols matched the given filters."}]
+            }));
+        }
+
+        let total = hits.len();
+        let truncated = total > limit;
+        let shown: Vec<&Symbol> = hits.into_iter().take(limit).collect();
+
+        let header = if truncated {
+            format!("Symbols ({} shown of {total})", shown.len())
+        } else {
+            format!("Symbols ({total})")
+        };
+        let mut text = format_symbols(&header, &shown);
+        if truncated {
+            text.push_str(&format!(
+                "\n\n(Showing first {limit}. Raise `limit` to see more.)"
+            ));
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_files(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let repo = args["repo"].as_str().unwrap_or(".");
+        let lang = string_array(&args, "lang");
+        let path_globs = string_array(&args, "path");
+        let exclude_globs = string_array(&args, "exclude");
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        let glob_paths =
+            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+                JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                }
+            })?;
+
+        // Collect distinct file paths + their dominant language tag. A file
+        // can technically have chunks with no language (text fallback), so
+        // we keep the first non-empty tag seen.
+        let mut seen: std::collections::HashMap<&str, Option<&str>> =
+            std::collections::HashMap::new();
+        for chunk in index.chunks() {
+            let entry = seen.entry(chunk.file_path.as_str()).or_insert(None);
+            if entry.is_none() {
+                *entry = chunk.language.as_deref();
+            }
+        }
+
+        let allowed: Option<std::collections::HashSet<&str>> = glob_paths
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let mut files: Vec<&str> = seen
+            .iter()
+            .filter(|(path, _)| match &allowed {
+                Some(set) => set.contains(*path),
+                None => true,
+            })
+            .filter(|(_, lang_opt)| {
+                if lang.is_empty() {
+                    return true;
+                }
+                match lang_opt {
+                    Some(l) => lang.iter().any(|wanted| wanted == l),
+                    None => false,
+                }
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        files.sort();
+
+        if files.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": "No files matched the given filters."}]
+            }));
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": files.join("\n")}]
+        }))
+    }
+
+    async fn handle_scope_at(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let file_path = args["file_path"].as_str().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'file_path' parameter".into(),
+        })?;
+        let line = args["line"].as_u64().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'line' parameter".into(),
+        })? as usize;
+        let repo = args["repo"].as_str().unwrap_or(".");
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        // Innermost = symbol with the smallest range that still contains `line`.
+        // Ties broken by the later start_line (more specific). Both `start_line`
+        // and `end_line` are 1-indexed and inclusive.
+        let innermost = index
+            .symbols()
+            .iter()
+            .filter(|s| s.file_path == file_path)
+            .filter(|s| s.start_line <= line && line <= s.end_line)
+            .min_by(|a, b| {
+                let a_span = a.end_line.saturating_sub(a.start_line);
+                let b_span = b.end_line.saturating_sub(b.start_line);
+                a_span.cmp(&b_span).then(b.start_line.cmp(&a.start_line))
+            });
+
+        let text = match innermost {
+            Some(s) => format!(
+                "{kind} {name} ({lang}) — {file}:{start}-{end}\n  query line {line} is inside this scope.",
+                kind = s.kind.as_str(),
+                name = s.name,
+                lang = s.language,
+                file = s.file_path,
+                start = s.start_line,
+                end = s.end_line,
+            ),
+            None => format!(
+                "No tree-sitter symbol contains {file_path}:{line}. Either the file is in an unsupported language, the line is module-level prelude before the first definition, or the path is not in the index."
+            ),
+        };
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_read(&self, args: Value) -> Result<Value, JsonRpcError> {
+        const MAX_LINES_PER_CALL: usize = 500;
+
+        let file_path = args["file_path"].as_str().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'file_path' parameter".into(),
+        })?;
+        let start_line = args["start_line"].as_u64().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'start_line' parameter".into(),
+        })? as usize;
+        let end_line = args["end_line"].as_u64().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'end_line' parameter".into(),
+        })? as usize;
+        let repo = args["repo"].as_str().unwrap_or(".");
+
+        if start_line == 0 {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: "start_line must be >= 1 (1-indexed).".into(),
+            });
+        }
+        if end_line < start_line {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: format!("end_line ({end_line}) must be >= start_line ({start_line})."),
+            });
+        }
+        if repo.starts_with("https://") || repo.starts_with("http://") {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: "`read` is not supported for git URLs — clone locally and pass the path."
+                    .into(),
+            });
+        }
+
+        // Reject any path that could escape the repo. We check the raw
+        // string before joining: absolute paths, parent traversal, and
+        // backslash separators (Windows-style) are all rejected.
+        let rejected = file_path.starts_with('/')
+            || file_path.starts_with('\\')
+            || file_path.contains("..")
+            || file_path.contains('\0');
+        if rejected {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: format!("Refusing unsafe file_path {file_path:?} — must be relative, no '..', no leading '/'."),
+            });
+        }
+
+        let repo_path = Path::new(repo);
+        if !repo_path.is_dir() {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: format!("Repo path is not a directory: {repo}"),
+            });
+        }
+        let abs = repo_path.join(file_path);
+
+        // Cap the range before reading so a 5000-line request doesn't
+        // pull the whole file into memory.
+        let effective_end = end_line.min(start_line + MAX_LINES_PER_CALL - 1);
+        let truncated = effective_end < end_line;
+
+        let raw = std::fs::read_to_string(&abs).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("read {}: {e}", abs.display()),
+        })?;
+        let lines: Vec<&str> = raw.lines().collect();
+        let total = lines.len();
+        if start_line > total {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: format!(
+                    "start_line {start_line} is past end of file (total lines: {total})."
+                ),
+            });
+        }
+        let end_clamped = effective_end.min(total);
+        let slice = &lines[start_line - 1..end_clamped];
+
+        let body = slice
+            .iter()
+            .enumerate()
+            .map(|(i, ln)| format!("{:>5}  {}", start_line + i, ln))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut header_parts = vec![format!("{file_path}:{start_line}-{end_clamped}")];
+        if truncated {
+            header_parts.push(format!(
+                "(capped at {MAX_LINES_PER_CALL} lines; requested up to {end_line})"
+            ));
+        }
+        let text = format!("{}\n```\n{body}\n```", header_parts.join("  "));
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_status(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let repo = args["repo"].as_str().unwrap_or(".");
+        if repo.starts_with("https://") || repo.starts_with("http://") {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: "`status` is not supported for git URLs — they don't have a persisted on-disk index to compare against."
+                    .into(),
+            });
+        }
+        let repo_path = Path::new(repo);
+        if !repo_path.is_dir() {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: format!("Repo path is not a directory: {repo}"),
+            });
+        }
+
+        if !veles_core::persist::index_exists(repo_path) {
+            return Ok(json!({
+                "content": [{"type": "text", "text": format!("No index found at {}/.veles. Run `search` once to create it.", repo_path.display())}]
+            }));
+        }
+
+        let manifest =
+            veles_core::persist::load_manifest(repo_path).map_err(|e| JsonRpcError {
+                code: -32000,
+                message: format!("load manifest: {e}"),
+            })?;
+
+        let exts =
+            veles_core::walker::filter_extensions(None, manifest.include_text_files);
+        let on_disk: std::collections::HashMap<String, (u64, i64)> =
+            veles_core::walker::walk_files(repo_path, &exts)
+                .filter_map(|abs| {
+                    let rel = abs
+                        .strip_prefix(repo_path)
+                        .ok()?
+                        .to_string_lossy()
+                        .into_owned();
+                    let meta = std::fs::metadata(&abs).ok()?;
+                    let mtime = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    Some((rel, (meta.len(), mtime)))
+                })
+                .collect();
+
+        let mut added = 0usize;
+        let mut modified = 0usize;
+        for (rel, (size, mtime)) in &on_disk {
+            match manifest.files.get(rel) {
+                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {}
+                Some(_) => modified += 1,
+                None => added += 1,
+            }
+        }
+        let removed = manifest
+            .files
+            .keys()
+            .filter(|k| !on_disk.contains_key(*k))
+            .count();
+
+        let mut lines: Vec<String> = vec![
+            format!("Index at {}/.veles", repo_path.display()),
+            format!("  veles version    : {}", manifest.veles_version),
+            format!("  format version   : {}", manifest.format_version),
+            format!("  model            : {}", manifest.model_name),
+            format!("  embedding dim    : {}", manifest.embedding_dim),
+            format!("  text files       : {}", manifest.include_text_files),
+            format!("  files in manifest: {}", manifest.files.len()),
+            format!("  total chunks     : {}", manifest.total_chunks),
+            String::new(),
+            "On-disk diff:".to_string(),
+            format!("  files seen now   : {}", on_disk.len()),
+            format!("  added            : {added}"),
+            format!("  modified         : {modified}"),
+            format!("  removed          : {removed}"),
+        ];
+        if added + modified + removed == 0 {
+            lines.push(String::new());
+            lines.push("Up to date.".to_string());
+        } else {
+            lines.push(String::new());
+            lines.push(format!("Run `update` (repo={repo}) to refresh."));
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": lines.join("\n")}]
         }))
     }
 
