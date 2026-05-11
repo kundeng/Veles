@@ -38,6 +38,8 @@ const PREVIEW_FILE_CACHE: usize = 8;
 pub enum ResultsKind {
     Query { query: String },
     Related { anchor: String },
+    Defs { name: String },
+    Refs { name: String, def_count: usize },
 }
 
 /// Action to perform after the TUI exits cleanly.
@@ -229,6 +231,8 @@ impl App {
         self.results_kind = match done.kind {
             ResultKind::Query => ResultsKind::Query { query: done.query },
             ResultKind::Related { anchor } => ResultsKind::Related { anchor },
+            ResultKind::Defs { name } => ResultsKind::Defs { name },
+            ResultKind::Refs { name, def_count } => ResultsKind::Refs { name, def_count },
         };
         if done.seq == self.seq {
             self.searching = false;
@@ -274,6 +278,37 @@ impl App {
         let _ = self.cmd_tx.send(WorkerCmd::Related {
             seq: self.seq,
             source: Box::new(chunk),
+            top_k: TOP_K,
+        });
+    }
+
+    fn dispatch_defs(&mut self) {
+        let name = self.query.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.seq += 1;
+        self.searching = true;
+        self.pending_query = false;
+        self.next_dispatch_at = None;
+        let _ = self.cmd_tx.send(WorkerCmd::Defs {
+            seq: self.seq,
+            query: name,
+        });
+    }
+
+    fn dispatch_refs(&mut self) {
+        let name = self.query.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.seq += 1;
+        self.searching = true;
+        self.pending_query = false;
+        self.next_dispatch_at = None;
+        let _ = self.cmd_tx.send(WorkerCmd::Refs {
+            seq: self.seq,
+            query: name,
             top_k: TOP_K,
         });
     }
@@ -326,6 +361,8 @@ impl App {
             KeyCode::Enter => self.action_print(),
             KeyCode::Char('o') if ctrl => self.action_editor(),
             KeyCode::Char('r') if ctrl => self.dispatch_related(),
+            KeyCode::Char('d') if ctrl => self.dispatch_defs(),
+            KeyCode::Char('f') if ctrl => self.dispatch_refs(),
 
             // Result navigation.
             KeyCode::Up => self.move_selected(-1),
@@ -521,6 +558,13 @@ impl App {
                 .filter(|t| !t.is_empty())
                 .map(|s| s.to_string())
                 .collect(),
+            ResultsKind::Defs { name } | ResultsKind::Refs { name, .. } => {
+                if name.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![name.clone()]
+                }
+            }
             ResultsKind::Related { .. } => Vec::new(),
         }
     }

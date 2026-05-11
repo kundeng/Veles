@@ -142,6 +142,24 @@ fn render_query(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(anchor.clone(), Style::default().fg(ACCENT)),
             Span::raw(" "),
         ]),
+        ResultsKind::Defs { name } => Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Defs of ",
+                Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("`{name}`"), Style::default().fg(ACCENT)),
+            Span::raw(" "),
+        ]),
+        ResultsKind::Refs { name, .. } => Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Refs of ",
+                Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("`{name}`"), Style::default().fg(ACCENT)),
+            Span::raw(" "),
+        ]),
         ResultsKind::Query { .. } => Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -221,6 +239,34 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::styled(format!("  {pos}/{total} "), Style::default().fg(FAINT)),
         ]),
+        ResultsKind::Defs { name } => Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Defs",
+                Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" `{name}`"), Style::default().fg(ACCENT)),
+            Span::styled(format!("  {pos}/{total} "), Style::default().fg(FAINT)),
+        ]),
+        ResultsKind::Refs { name, def_count } => {
+            // Refs results = first `def_count` rows are tree-sitter
+            // definitions, the rest are BM25 reference hits. The header
+            // shows both counts so the user sees "2 defs + 5 refs" at a
+            // glance instead of just an opaque total.
+            let ref_count = total.saturating_sub(*def_count);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "Refs",
+                    Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" `{name}`"), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("  {def_count} defs + {ref_count} refs "),
+                    Style::default().fg(FAINT),
+                ),
+            ])
+        }
         ResultsKind::Query { .. } => Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -485,6 +531,8 @@ fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
         kbd("Enter", "print path:line and quit"),
         kbd("Ctrl-O", "open in $EDITOR"),
         kbd("Ctrl-R", "find code related to selection"),
+        kbd("Ctrl-D", "definitions of typed identifier"),
+        kbd("Ctrl-F", "definitions + references of typed identifier"),
         kbd("?", "full keybinding help"),
         kbd("Esc", "quit"),
         Line::from(""),
@@ -522,6 +570,10 @@ fn render_keys(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" mode  ", Style::default().fg(FAINT)),
         Span::styled("Ctrl-R", Style::default().fg(ACCENT)),
         Span::styled(" related  ", Style::default().fg(FAINT)),
+        Span::styled("Ctrl-D", Style::default().fg(ACCENT)),
+        Span::styled(" defs  ", Style::default().fg(FAINT)),
+        Span::styled("Ctrl-F", Style::default().fg(ACCENT)),
+        Span::styled(" refs  ", Style::default().fg(FAINT)),
         Span::styled("Ctrl-O", Style::default().fg(ACCENT)),
         Span::styled(" editor  ", Style::default().fg(FAINT)),
         Span::styled("?", Style::default().fg(ACCENT)),
@@ -537,7 +589,7 @@ fn render_keys(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 22u16.min(area.height.saturating_sub(4));
+    let h = 26u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect {
@@ -577,6 +629,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         kbd("Enter", "print path:line to stdout, then quit"),
         kbd("Ctrl-O", "open file in $EDITOR ($VISUAL > $EDITOR > vi)"),
         kbd("Ctrl-R", "find code semantically related to selection"),
+        kbd("Ctrl-D", "tree-sitter definitions of the typed identifier"),
+        kbd("Ctrl-F", "definitions + BM25 references of typed identifier"),
         Line::from(""),
         section("Query editing"),
         kbd("Ctrl-W", "delete word backward"),
