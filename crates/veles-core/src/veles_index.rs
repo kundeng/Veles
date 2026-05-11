@@ -313,6 +313,8 @@ impl VelesIndex {
         }
 
         // Build the keep set: indices of chunks belonging to unchanged files.
+        // Guaranteed sorted ascending because we iterate `self.chunks` in
+        // order — `DenseIndex::compact_and_extend` relies on this.
         let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
         let mut keep_indices: Vec<usize> = Vec::new();
         for (i, chunk) in self.chunks.iter().enumerate() {
@@ -320,14 +322,6 @@ impl VelesIndex {
                 keep_indices.push(i);
             }
         }
-
-        // Reuse embeddings of unchanged chunks (rows of the dense matrix —
-        // already L2-normalised; re-normalising is a no-op).
-        let kept_embeddings = self.dense_index.extract_rows(&keep_indices);
-        let kept_chunks: Vec<Chunk> = keep_indices
-            .iter()
-            .map(|&i| self.chunks[i].clone())
-            .collect();
 
         // Keep the symbols belonging to unchanged files; the rest get
         // re-extracted in lock-step with re-chunking.
@@ -382,34 +376,45 @@ impl VelesIndex {
             self.model.encode(&new_texts)
         };
 
-        // Combine kept + new.
-        let mut all_chunks = kept_chunks;
-        all_chunks.extend(new_chunks.iter().cloned());
-        let mut all_embeddings = kept_embeddings;
-        all_embeddings.extend(new_embeddings);
+        // Compact the existing dense matrix in place (§2.3): shift kept
+        // rows to the front in `keep_indices` order, truncate to that
+        // length, then append the freshly-embedded rows and L2-normalise
+        // only those. Replaces the previous extract→Vec<Vec>→DenseIndex::new
+        // round-trip (two full-corpus allocs + two copies).
+        self.dense_index
+            .compact_and_extend(&keep_indices, new_embeddings);
+
+        // Same in-place compaction for chunks: drop entries whose
+        // file_path is no longer in `unchanged_set`. `Vec::retain` does
+        // this without cloning the kept items.
+        self.chunks
+            .retain(|c| unchanged_set.contains(c.file_path.as_str()));
+        let new_chunks_count = new_chunks.len();
+        self.chunks.extend(new_chunks);
+
+        // Symbols are rebuilt from `kept_symbols + new_symbols` — the
+        // filter-cloned `kept_symbols` is already what we want.
         let mut all_symbols = kept_symbols;
         all_symbols.extend(new_symbols);
 
-        // Rebuild BM25 from full token set, dense from combined embeddings.
-        let bm25_index = build_bm25(&all_chunks);
-        let dense_index = DenseIndex::new(all_embeddings);
-        let (file_mapping, language_mapping) = build_mappings(&all_chunks);
+        // Rebuild BM25 + mappings from the now-current chunks vec.
+        let bm25_index = build_bm25(&self.chunks);
+        let (file_mapping, language_mapping) = build_mappings(&self.chunks);
 
         // Build a fresh manifest.
         let mut new_manifest = Manifest::new(
             &manifest.model_name,
-            self.dense_index.dim().max(dense_index.dim()),
+            self.dense_index.dim(),
             manifest.include_text_files,
         );
-        new_manifest.embedding_dim = dense_index.dim();
-        new_manifest.total_chunks = all_chunks.len();
+        new_manifest.embedding_dim = self.dense_index.dim();
+        new_manifest.total_chunks = self.chunks.len();
 
         // Per-file chunk counts for the new state.
         let mut chunk_counts: HashMap<&str, usize> = HashMap::new();
-        for c in &all_chunks {
+        for c in &self.chunks {
             *chunk_counts.entry(c.file_path.as_str()).or_default() += 1;
         }
-        let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
         for (rel, (abs, size, mtime)) in &on_disk {
             // Resolve a content hash for this file:
             //  - prefer the value we already computed during classification;
@@ -450,13 +455,11 @@ impl VelesIndex {
             removed_files: removed.len(),
             mtime_refreshed_files: 0,
             kept_chunks: keep_indices.len(),
-            new_chunks: new_chunks.len(),
-            total_chunks: all_chunks.len(),
+            new_chunks: new_chunks_count,
+            total_chunks: self.chunks.len(),
         };
 
-        self.chunks = all_chunks;
         self.bm25_index = bm25_index;
-        self.dense_index = dense_index;
         self.file_mapping = file_mapping;
         self.language_mapping = language_mapping;
         self.symbols = all_symbols;
