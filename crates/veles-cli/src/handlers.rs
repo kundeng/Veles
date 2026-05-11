@@ -170,15 +170,23 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     }
 
     index.save(&path_buf)?;
-    println!(
-        "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed (kept {} chunks, embedded {} new, total {})",
-        report.added_files,
-        report.modified_files,
-        report.removed_files,
-        report.kept_chunks,
-        report.new_chunks,
-        report.total_chunks,
-    );
+    if report.added_files + report.modified_files + report.removed_files == 0 {
+        println!(
+            "Refreshed manifest in {secs:.2}s — {} file(s) had stale mtime but unchanged content (kept {} chunks).",
+            report.mtime_refreshed_files, report.total_chunks,
+        );
+    } else {
+        println!(
+            "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed, ⟳{} mtime-only (kept {} chunks, embedded {} new, total {})",
+            report.added_files,
+            report.modified_files,
+            report.removed_files,
+            report.mtime_refreshed_files,
+            report.kept_chunks,
+            report.new_chunks,
+            report.total_chunks,
+        );
+    }
     Ok(())
 }
 
@@ -191,10 +199,17 @@ pub fn handle_status(path: String) -> Result<()> {
     let manifest = persist::load_manifest(&path_buf)?;
 
     // Compute drift without loading chunks/embeddings.
+    //
+    // Classification mirrors `VelesIndex::update_from_path` so the two
+    // commands agree: a file whose `(size, mtime)` mismatches the manifest
+    // is only reported as `modified` if its bytes also changed — `touch` /
+    // `git checkout` of identical bytes falls into `mtime-only` instead,
+    // matching `update`'s no-op-but-refresh fast path.
     let exts = veles_core::walker::filter_extensions(None, manifest.include_text_files);
     let mut added = 0usize;
     let mut modified = 0usize;
-    let on_disk: std::collections::HashMap<String, (u64, i64)> =
+    let mut mtime_only = 0usize;
+    let on_disk: std::collections::HashMap<String, (PathBuf, u64, i64)> =
         veles_core::walker::walk_files(&path_buf, &exts)
             .filter_map(|abs| {
                 let rel = abs
@@ -210,13 +225,19 @@ pub fn handle_status(path: String) -> Result<()> {
                     .ok()
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                Some((rel, (meta.len(), mtime)))
+                Some((rel, (abs, meta.len(), mtime)))
             })
             .collect();
     let on_disk_files = on_disk.len();
-    for (rel, (size, mtime)) in &on_disk {
+    for (rel, (abs, size, mtime)) in &on_disk {
         match manifest.files.get(rel) {
             Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {}
+            Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
+                match persist::content_hash(abs) {
+                    Ok(h) if Some(&h) == prev.content_hash.as_ref() => mtime_only += 1,
+                    Ok(_) | Err(_) => modified += 1,
+                }
+            }
             Some(_) => modified += 1,
             None => added += 1,
         }
@@ -242,8 +263,14 @@ pub fn handle_status(path: String) -> Result<()> {
     println!("  added            : {added}");
     println!("  modified         : {modified}");
     println!("  removed          : {removed}");
-    if added + modified + removed == 0 {
+    println!("  mtime-only       : {mtime_only}");
+    if added + modified + removed + mtime_only == 0 {
         println!("\nUp to date.");
+    } else if added + modified + removed == 0 {
+        println!(
+            "\n{mtime_only} file(s) had mtime drift but unchanged content. \
+             Run `veles update {path}` to refresh fingerprints (no re-embed)."
+        );
     } else {
         println!("\nRun `veles update {path}` to refresh.");
     }

@@ -151,10 +151,7 @@ fn worker_loop(index: Arc<VelesIndex>, cmd_rx: Receiver<WorkerCmd>, msg_tx: Send
                     query: name.clone(),
                     results,
                     elapsed_ms,
-                    kind: ResultKind::Refs {
-                        name,
-                        def_count,
-                    },
+                    kind: ResultKind::Refs { name, def_count },
                 }));
             }
         }

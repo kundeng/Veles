@@ -630,7 +630,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         kbd("Ctrl-O", "open file in $EDITOR ($VISUAL > $EDITOR > vi)"),
         kbd("Ctrl-R", "find code semantically related to selection"),
         kbd("Ctrl-D", "tree-sitter definitions of the typed identifier"),
-        kbd("Ctrl-F", "definitions + BM25 references of typed identifier"),
+        kbd(
+            "Ctrl-F",
+            "definitions + BM25 references of typed identifier",
+        ),
         Line::from(""),
         section("Query editing"),
         kbd("Ctrl-W", "delete word backward"),

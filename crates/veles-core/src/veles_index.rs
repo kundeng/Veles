@@ -278,12 +278,59 @@ impl VelesIndex {
             .cloned()
             .collect();
 
-        // Fast path: nothing to do.
+        // Fast path: no chunk-level changes. Two sub-cases:
+        //   (a) `(size, mtime)` matched for every file — the manifest is
+        //       already accurate; return a true no-op.
+        //   (b) some files had mtime drift that we resolved via content_hash —
+        //       refresh those entries in the manifest so the next `status` /
+        //       `update` doesn't have to re-hash, then signal the caller to
+        //       persist (so `veles_version` / `indexed_at` also get bumped).
         if modified.is_empty() && added.is_empty() && removed.is_empty() {
+            let mtime_refreshed_files = computed_hashes.len();
+            if mtime_refreshed_files == 0 {
+                return Ok(UpdateReport {
+                    added_files: 0,
+                    modified_files: 0,
+                    removed_files: 0,
+                    mtime_refreshed_files: 0,
+                    kept_chunks: self.chunks.len(),
+                    new_chunks: 0,
+                    total_chunks: self.chunks.len(),
+                });
+            }
+
+            // Manifest-only refresh: same chunks, same embeddings, fresh
+            // metadata. We rebuild from scratch so version / indexed_at pick
+            // up the current binary's values via `Manifest::new`.
+            let mut new_manifest = Manifest::new(
+                &manifest.model_name,
+                manifest.embedding_dim,
+                manifest.include_text_files,
+            );
+            new_manifest.total_chunks = manifest.total_chunks;
+            for (rel, (abs, size, mtime)) in &on_disk {
+                let prev = manifest.files.get(rel);
+                let content_hash = computed_hashes
+                    .remove(rel)
+                    .or_else(|| prev.and_then(|p| p.content_hash.clone()))
+                    .or_else(|| persist::content_hash(abs).ok());
+                let chunk_count = prev.map(|p| p.chunk_count).unwrap_or(0);
+                new_manifest.files.insert(
+                    rel.clone(),
+                    FileFingerprint {
+                        size: *size,
+                        mtime_secs: *mtime,
+                        chunk_count,
+                        content_hash,
+                    },
+                );
+            }
+            self.manifest = Some(new_manifest);
             return Ok(UpdateReport {
                 added_files: 0,
                 modified_files: 0,
                 removed_files: 0,
+                mtime_refreshed_files,
                 kept_chunks: self.chunks.len(),
                 new_chunks: 0,
                 total_chunks: self.chunks.len(),
@@ -418,10 +465,15 @@ impl VelesIndex {
             );
         }
 
+        // `mtime_refreshed_files` is only meaningful on the manifest-only
+        // refresh fast path; here the manifest is rebuilt from scratch, so
+        // any mtime drift on unchanged files is already absorbed into the
+        // new fingerprints.
         let report = UpdateReport {
             added_files: added.len(),
             modified_files: modified.len(),
             removed_files: removed.len(),
+            mtime_refreshed_files: 0,
             kept_chunks: keep_indices.len(),
             new_chunks: new_chunks.len(),
             total_chunks: all_chunks.len(),

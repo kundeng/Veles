@@ -468,7 +468,19 @@ impl IndexCache {
         let model = self.model.clone();
         let path = Path::new(repo);
         let index = if path.is_dir() {
-            VelesIndex::from_path(path, Some(model), None, include_text_files)?
+            // Prefer the persisted index when one exists: keeps `stats`,
+            // `status`, and `update` consistent (they all see the same
+            // chunk count / manifest), and avoids re-embedding on every
+            // process start. Fall back to a fresh in-memory build if the
+            // load fails (incompatible format, missing files, ...).
+            if veles_core::persist::index_exists(path) {
+                match VelesIndex::load(path, model.clone()) {
+                    Ok(idx) => idx,
+                    Err(_) => VelesIndex::from_path(path, Some(model), None, include_text_files)?,
+                }
+            } else {
+                VelesIndex::from_path(path, Some(model), None, include_text_files)?
+            }
         } else if repo.starts_with("https://") || repo.starts_with("http://") {
             VelesIndex::from_git(repo, None, Some(model), include_text_files)?
         } else {
@@ -962,21 +974,30 @@ impl McpServer {
                 report.total_chunks
             )
         } else {
-            // Persist only when something actually changed.
+            // Persist only when something actually changed (chunk-level edits
+            // or a manifest-only mtime refresh).
             index.save(&path_buf).map_err(|e| JsonRpcError {
                 code: -32000,
                 message: format!("update applied in memory but save failed: {e}"),
             })?;
-            format!(
-                "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed (kept {} chunks, embedded {} new, total {}). Persisted to {}/.veles.",
-                report.added_files,
-                report.modified_files,
-                report.removed_files,
-                report.kept_chunks,
-                report.new_chunks,
-                report.total_chunks,
-                repo,
-            )
+            if report.added_files + report.modified_files + report.removed_files == 0 {
+                format!(
+                    "Refreshed manifest in {secs:.2}s — {} file(s) had stale mtime but unchanged content (kept {} chunks). Persisted to {}/.veles.",
+                    report.mtime_refreshed_files, report.total_chunks, repo,
+                )
+            } else {
+                format!(
+                    "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed, ⟳{} mtime-only (kept {} chunks, embedded {} new, total {}). Persisted to {}/.veles.",
+                    report.added_files,
+                    report.modified_files,
+                    report.removed_files,
+                    report.mtime_refreshed_files,
+                    report.kept_chunks,
+                    report.new_chunks,
+                    report.total_chunks,
+                    repo,
+                )
+            }
         };
 
         Ok(json!({
@@ -1222,7 +1243,9 @@ impl McpServer {
         if rejected {
             return Err(JsonRpcError {
                 code: -32602,
-                message: format!("Refusing unsafe file_path {file_path:?} — must be relative, no '..', no leading '/'."),
+                message: format!(
+                    "Refusing unsafe file_path {file_path:?} — must be relative, no '..', no leading '/'."
+                ),
             });
         }
 
@@ -1300,15 +1323,13 @@ impl McpServer {
             }));
         }
 
-        let manifest =
-            veles_core::persist::load_manifest(repo_path).map_err(|e| JsonRpcError {
-                code: -32000,
-                message: format!("load manifest: {e}"),
-            })?;
+        let manifest = veles_core::persist::load_manifest(repo_path).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("load manifest: {e}"),
+        })?;
 
-        let exts =
-            veles_core::walker::filter_extensions(None, manifest.include_text_files);
-        let on_disk: std::collections::HashMap<String, (u64, i64)> =
+        let exts = veles_core::walker::filter_extensions(None, manifest.include_text_files);
+        let on_disk: std::collections::HashMap<String, (std::path::PathBuf, u64, i64)> =
             veles_core::walker::walk_files(repo_path, &exts)
                 .filter_map(|abs| {
                     let rel = abs
@@ -1324,15 +1345,25 @@ impl McpServer {
                         .ok()
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    Some((rel, (meta.len(), mtime)))
+                    Some((rel, (abs, meta.len(), mtime)))
                 })
                 .collect();
 
+        // Mirror `VelesIndex::update_from_path` classification so a stale
+        // mtime alone (touch / git checkout of identical bytes) doesn't
+        // produce a false-positive "modified" count.
         let mut added = 0usize;
         let mut modified = 0usize;
-        for (rel, (size, mtime)) in &on_disk {
+        let mut mtime_only = 0usize;
+        for (rel, (abs, size, mtime)) in &on_disk {
             match manifest.files.get(rel) {
                 Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {}
+                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
+                    match veles_core::persist::content_hash(abs) {
+                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => mtime_only += 1,
+                        Ok(_) | Err(_) => modified += 1,
+                    }
+                }
                 Some(_) => modified += 1,
                 None => added += 1,
             }
@@ -1358,10 +1389,17 @@ impl McpServer {
             format!("  added            : {added}"),
             format!("  modified         : {modified}"),
             format!("  removed          : {removed}"),
+            format!("  mtime-only       : {mtime_only}"),
         ];
-        if added + modified + removed == 0 {
+        if added + modified + removed + mtime_only == 0 {
             lines.push(String::new());
             lines.push("Up to date.".to_string());
+        } else if added + modified + removed == 0 {
+            lines.push(String::new());
+            lines.push(format!(
+                "{mtime_only} file(s) had mtime drift but unchanged content. \
+                 Run `update` (repo={repo}) to refresh fingerprints (no re-embed)."
+            ));
         } else {
             lines.push(String::new());
             lines.push(format!("Run `update` (repo={repo}) to refresh."));

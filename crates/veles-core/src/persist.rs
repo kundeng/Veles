@@ -271,10 +271,15 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 pub struct UpdateReport {
     /// Files seen on disk that weren't in the previous manifest.
     pub added_files: usize,
-    /// Files whose `(size, mtime)` fingerprint changed.
+    /// Files whose `(size, mtime)` fingerprint changed and whose content
+    /// (when checked via `content_hash`) actually differed.
     pub modified_files: usize,
     /// Files in the previous manifest no longer present on disk.
     pub removed_files: usize,
+    /// Files whose `mtime` drifted but whose `content_hash` still matched —
+    /// no re-embedding needed, but the manifest's fingerprint was refreshed
+    /// so subsequent `status` / `update` calls skip the hash recompute.
+    pub mtime_refreshed_files: usize,
     /// Chunks reused from the previous index without re-embedding.
     pub kept_chunks: usize,
     /// Chunks freshly embedded for added/modified files.
@@ -284,9 +289,13 @@ pub struct UpdateReport {
 }
 
 impl UpdateReport {
-    /// True when no files were added, modified, or removed.
+    /// True when nothing changed — no chunk-level edits and no fingerprint
+    /// refreshes pending. Callers use this to skip persistence.
     pub fn is_noop(&self) -> bool {
-        self.added_files == 0 && self.modified_files == 0 && self.removed_files == 0
+        self.added_files == 0
+            && self.modified_files == 0
+            && self.removed_files == 0
+            && self.mtime_refreshed_files == 0
     }
 }
 
