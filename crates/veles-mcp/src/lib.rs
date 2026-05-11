@@ -66,13 +66,13 @@
 //! [Veles]: https://github.com/julymetodiev/Veles
 //! [MCP 2024-11-05]: https://modelcontextprotocol.io/specification/2024-11-05
 
-use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use veles_core::filter;
 use veles_core::symbols::Symbol;
@@ -464,15 +464,18 @@ impl McpServer {
     }
 
     /// Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
+    ///
+    /// Uses tokio's async stdin/stdout so the runtime stays responsive
+    /// while we await the parse / dispatch of each request (§4.3 of the
+    /// perf plan). The previous sync `BufRead.lines()` loop pinned a
+    /// worker thread on `read(2)`; with async I/O the worker is free to
+    /// run other tasks while we wait for input.
     pub async fn run(&self) -> Result<()> {
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin).lines();
+        let mut stdout = tokio::io::stdout();
 
-        // Send an initialization notification to signal readiness.
-        // MCP servers are expected to just respond to requests.
-
-        for line in stdin.lock().lines() {
-            let line = line?;
+        while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -489,16 +492,19 @@ impl McpServer {
                             message: format!("Parse error: {e}"),
                         }),
                     };
-                    writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-                    stdout.flush()?;
+                    let line = serde_json::to_string(&resp)?;
+                    stdout.write_all(line.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                     continue;
                 }
             };
 
             let response = self.handle_request(request).await;
             let response_str = serde_json::to_string(&response)?;
-            writeln!(stdout, "{response_str}")?;
-            stdout.flush()?;
+            stdout.write_all(response_str.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
         }
 
         Ok(())

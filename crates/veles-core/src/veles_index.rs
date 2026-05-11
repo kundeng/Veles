@@ -601,10 +601,20 @@ impl VelesIndex {
     }
 
     /// Resolve a file path and line number to the containing chunk.
+    ///
+    /// Uses the pre-built `file_mapping` to scan only the chunks of the
+    /// target file rather than the whole corpus (§5.2 of the perf plan).
+    /// On a 200K-chunk repo with 5K files this turns an O(N) scan into
+    /// roughly O(chunks_per_file) — typically a handful.
     pub fn resolve_chunk(&self, file_path: &str, line: usize) -> Option<&Chunk> {
+        let indices = self.file_mapping.get(file_path)?;
         let mut fallback = None;
-        for chunk in &self.chunks {
-            if chunk.file_path == file_path && chunk.start_line <= line && line <= chunk.end_line {
+        for &i in indices {
+            let chunk = &self.chunks[i];
+            if chunk.start_line <= line && line <= chunk.end_line {
+                // The overlap window means a line on the boundary is in
+                // two chunks; prefer the one where the line is strictly
+                // inside (not the trailing edge).
                 if line < chunk.end_line {
                     return Some(chunk);
                 }

@@ -168,6 +168,17 @@ pub struct PersistedIndex {
 }
 
 /// Write all index artefacts to `<repo_root>/.veles/`.
+///
+/// Manifest goes first synchronously so a partial-failure left-over
+/// has the freshest pointer to "what was meant to be saved". The four
+/// bincode artefacts are then written in parallel via `rayon::join`
+/// nested 2×2 (§5.7 of the perf plan) — modern filesystems handle
+/// concurrent same-dir creates fine, and the per-file `BufWriter` +
+/// bincode encode work in CPU dominate I/O for large indexes.
+///
+/// Also drops the previous `chunks.to_vec()` / `symbols.to_vec()`
+/// temporaries: slices implement `Serialize`, so we feed them in
+/// directly and skip the per-save full copy.
 pub fn save(
     repo_root: &Path,
     manifest: &Manifest,
@@ -180,10 +191,30 @@ pub fn save(
     fs::create_dir_all(&dir).with_context(|| format!("create index dir {}", dir.display()))?;
 
     write_json(&dir.join(MANIFEST_FILE), manifest)?;
-    write_bincode(&dir.join(CHUNKS_FILE), &chunks.to_vec())?;
-    write_bincode(&dir.join(BM25_FILE), bm25)?;
-    write_bincode(&dir.join(DENSE_FILE), dense)?;
-    write_bincode(&dir.join(SYMBOLS_FILE), &symbols.to_vec())?;
+
+    let chunks_path = dir.join(CHUNKS_FILE);
+    let bm25_path = dir.join(BM25_FILE);
+    let dense_path = dir.join(DENSE_FILE);
+    let symbols_path = dir.join(SYMBOLS_FILE);
+
+    let ((r1, r2), (r3, r4)) = rayon::join(
+        || {
+            rayon::join(
+                || write_bincode(&chunks_path, &chunks),
+                || write_bincode(&bm25_path, bm25),
+            )
+        },
+        || {
+            rayon::join(
+                || write_bincode(&dense_path, dense),
+                || write_bincode(&symbols_path, &symbols),
+            )
+        },
+    );
+    r1?;
+    r2?;
+    r3?;
+    r4?;
     Ok(())
 }
 
