@@ -444,8 +444,15 @@ pub fn handle_tui(
     multilingual: bool,
     include_text_files: bool,
     no_cache: bool,
+    debug_keys: bool,
 ) -> Result<()> {
-    crate::tui::run(path, multilingual, include_text_files, !no_cache)
+    crate::tui::run(
+        path,
+        multilingual,
+        include_text_files,
+        !no_cache,
+        debug_keys,
+    )
 }
 
 pub async fn handle_serve_grpc(addr: String) -> Result<()> {

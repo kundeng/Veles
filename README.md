@@ -134,14 +134,31 @@ veles clean .              # remove .veles/
 ```sh
 veles tui                          # live hybrid search with preview pane
 veles tui ./my-repo                # against another repo
+veles tui --debug-keys             # echo every keypress (terminal diagnostic)
 ```
 
 Loads the persistent index once, then debounces queries so each keystroke
-re-runs in tens of milliseconds. `↑↓` navigate, `Tab` cycles
-hybrid/bm25/semantic, `Ctrl-R` finds related code, `Ctrl-D` / `Ctrl-F`
-show tree-sitter definitions / references for the typed identifier,
-`Enter` prints `path:line` to stdout (`$EDITOR $(veles tui)` works),
-`Ctrl-O` opens in `$EDITOR`, `?` shows the full keybinding overlay.
+re-runs in tens of milliseconds. Highlights:
+
+- **Search** — `↑↓` navigate, `Tab` cycles `hybrid`/`bm25`/`semantic`.
+- **Lookups** — `Ctrl-D` defs, `Ctrl-F` refs, `Ctrl-R` semantically related.
+  With an empty query, Ctrl-D / Ctrl-F use the selected row's symbol.
+- **History** — `Ctrl-B` / `Ctrl-X` (also `F2`/`F3`, `Alt-←`/`→`, `Alt-h`/`l`)
+  jump back and forward across past views — like a browser.
+- **Query recall** — `Ctrl-↑` / `Ctrl-↓` (also `Alt-P`/`Alt-N`) walk past
+  queries, recorded at Enter, Ctrl-O, Ctrl-R/D/F, and Ctrl-U.
+- **Filters** — `Ctrl-T` cycles language filter through the indexed
+  languages, `Ctrl-Y` opens a path-glob input. Both pass through to
+  every dispatch (search, related, defs, refs).
+- **Preview** — `Shift-↑↓` / `Shift-PgUp/PgDn` scroll within the chunk;
+  `F5`–`F8` are non-modifier fallbacks for terminals that swallow Shift+Arrow.
+- **Open** — `Enter` prints `path:line` to stdout (`$EDITOR $(veles tui)`
+  works), `Ctrl-O` spawns `$EDITOR` in-place and returns to the TUI on
+  exit. Editor heuristic covers vim / nvim / emacs / nano / VS Code /
+  Cursor / Windsurf / Helix; set `$EDITOR=vim` (or `$VISUAL`) to pick.
+- **Help** — `?` (when the query is empty) opens a scrollable keybinding
+  overlay; `Ctrl-G` cancels an in-flight search (readline convention);
+  `Esc` / `Ctrl-C` quit.
 
 ### Servers
 

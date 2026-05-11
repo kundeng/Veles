@@ -131,7 +131,8 @@ async fn main() -> Result<()> {
             multilingual,
             include_text_files,
             no_cache,
-        }) => handlers::handle_tui(path, multilingual, include_text_files, no_cache),
+            debug_keys,
+        }) => handlers::handle_tui(path, multilingual, include_text_files, no_cache, debug_keys),
 
         Some(Commands::Completions { shell }) => handlers::handle_completions(shell),
 

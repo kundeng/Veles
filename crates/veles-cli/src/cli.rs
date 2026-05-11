@@ -249,6 +249,11 @@ pub enum Commands {
         /// Force a fresh in-memory build, ignoring any `.veles/` cache.
         #[arg(long)]
         no_cache: bool,
+        /// Echo every keypress to the status bar so you can verify which
+        /// modifier/key codes your terminal actually forwards. Useful on
+        /// macOS where Alt-* and F-keys often need explicit configuration.
+        #[arg(long)]
+        debug_keys: bool,
     },
 
     /// Print a shell completion script to stdout.
