@@ -138,9 +138,10 @@ veles tui ./my-repo                # against another repo
 
 Loads the persistent index once, then debounces queries so each keystroke
 re-runs in tens of milliseconds. `↑↓` navigate, `Tab` cycles
-hybrid/bm25/semantic, `Ctrl-R` finds related code, `Enter` prints
-`path:line` to stdout (`$EDITOR $(veles tui)` works), `Ctrl-O` opens in
-`$EDITOR`, `?` shows the full keybinding overlay.
+hybrid/bm25/semantic, `Ctrl-R` finds related code, `Ctrl-D` / `Ctrl-F`
+show tree-sitter definitions / references for the typed identifier,
+`Enter` prints `path:line` to stdout (`$EDITOR $(veles tui)` works),
+`Ctrl-O` opens in `$EDITOR`, `?` shows the full keybinding overlay.
 
 ### Servers
 
