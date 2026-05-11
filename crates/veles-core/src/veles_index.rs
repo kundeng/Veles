@@ -213,69 +213,44 @@ impl VelesIndex {
 
         let exts = walker::filter_extensions(None, manifest.include_text_files);
 
-        // Discover files currently on disk and their fingerprints (without
-        // chunk_count — that's filled in after chunking).
-        let on_disk: HashMap<String, (PathBuf, u64, i64)> = walker::walk_files(&root, &exts)
-            .filter_map(|abs_path| {
-                let rel = abs_path
-                    .strip_prefix(&root)
-                    .ok()?
-                    .to_string_lossy()
-                    .into_owned();
-                let meta = std::fs::metadata(&abs_path).ok()?;
-                let mtime = meta
-                    .modified()
-                    .ok()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                Some((rel, (abs_path, meta.len(), mtime)))
-            })
-            .collect();
+        // Walk the repo and classify every file in one place (§3.3).
+        // `classify_disk` lives in `persist` and is shared with the MCP
+        // status handler so both sides are guaranteed to agree on what
+        // counts as "modified" vs "mtime-only" vs "unchanged".
+        let state = persist::classify_disk(&root, &manifest, &exts);
 
-        // Classify files: unchanged / modified / added / removed.
-        //
-        // Fast path: matching (size, mtime) → unchanged without touching content.
-        // Slow path (only when fast path fails): if size matches and the
-        // previous manifest carries a BLAKE3 hash, hash the current bytes and
-        // compare. This catches `touch` / `git checkout` of an identical
-        // version / no-op formatter passes that drift the mtime without
-        // changing the bytes — saving an embedding round-trip.
+        // Re-derive the per-bucket Vec<String> the rest of this method
+        // already works with. Hashes computed during classification are
+        // hoisted out so we don't re-read the file when rebuilding the
+        // manifest below.
         let mut unchanged: Vec<String> = Vec::new();
         let mut modified: Vec<String> = Vec::new();
         let mut added: Vec<String> = Vec::new();
-        // Hashes we computed during classification, keyed by relative path.
-        // Reused when rebuilding the manifest to avoid re-reading the file.
         let mut computed_hashes: HashMap<String, String> = HashMap::new();
-
-        for (rel, (abs, size, mtime)) in &on_disk {
-            match manifest.files.get(rel) {
-                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {
+        for (rel, cls) in &state.classification {
+            match cls {
+                persist::Classification::Unchanged => unchanged.push(rel.clone()),
+                persist::Classification::MtimeOnly { hash } => {
                     unchanged.push(rel.clone());
+                    computed_hashes.insert(rel.clone(), hash.clone());
                 }
-                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
-                    match persist::content_hash(abs) {
-                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => {
-                            unchanged.push(rel.clone());
-                            computed_hashes.insert(rel.clone(), h);
-                        }
-                        Ok(h) => {
-                            modified.push(rel.clone());
-                            computed_hashes.insert(rel.clone(), h);
-                        }
-                        Err(_) => modified.push(rel.clone()),
+                persist::Classification::Modified { hash } => {
+                    modified.push(rel.clone());
+                    if let Some(h) = hash {
+                        computed_hashes.insert(rel.clone(), h.clone());
                     }
                 }
-                Some(_) => modified.push(rel.clone()),
-                None => added.push(rel.clone()),
+                persist::Classification::Added => added.push(rel.clone()),
             }
         }
-        let removed: Vec<String> = manifest
-            .files
-            .keys()
-            .filter(|k| !on_disk.contains_key(*k))
-            .cloned()
+        let removed = state.removed.clone();
+        // Compact alias used below for absolute-path / size / mtime
+        // lookups. Built from `state.on_disk` so the rest of the
+        // method doesn't have to change.
+        let on_disk: HashMap<String, (PathBuf, u64, i64)> = state
+            .on_disk
+            .iter()
+            .map(|(k, e)| (k.clone(), (e.abs_path.clone(), e.size, e.mtime_secs)))
             .collect();
 
         // Fast path: no chunk-level changes. Two sub-cases:
@@ -712,13 +687,35 @@ fn build_indexes(model: &StaticModel, chunks: &[Chunk]) -> (Bm25Index, DenseInde
 }
 
 /// Tokenize chunks (with path enrichment) and build a BM25 index.
+///
+/// Path tokens are computed **once per distinct file** and reused for
+/// every chunk of that file (§2.4 of the perf plan). A file with 50
+/// chunks used to pay 50× the path-split work — now it's a single
+/// tokenisation plus an extend per chunk.
 fn build_bm25(chunks: &[Chunk]) -> Bm25Index {
+    // Pre-compute path tokens per unique file path. Small map relative
+    // to chunk count (typically file_count ≈ chunks / 5). Done serially
+    // — the work is microseconds per file even on huge repos.
+    let mut path_tokens_by_file: HashMap<&str, Vec<String>> = HashMap::new();
+    for chunk in chunks {
+        path_tokens_by_file
+            .entry(chunk.file_path.as_str())
+            .or_insert_with(|| {
+                let mut tokens = Vec::new();
+                append_path_tokens(&chunk.file_path, &mut tokens);
+                tokens
+            });
+    }
+
     let tokenized: Vec<Vec<String>> = chunks
         .par_iter()
         .map(|chunk| {
-            let mut tokens: Vec<String> = Vec::with_capacity(64);
+            let path_tokens = path_tokens_by_file
+                .get(chunk.file_path.as_str())
+                .expect("path tokens pre-computed for every chunk's file_path");
+            let mut tokens: Vec<String> = Vec::with_capacity(64 + path_tokens.len());
             tokenize_into(&chunk.content, &mut tokens);
-            append_path_tokens(&chunk.file_path, &mut tokens);
+            tokens.extend(path_tokens.iter().cloned());
             tokens
         })
         .collect();

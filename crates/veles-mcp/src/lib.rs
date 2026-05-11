@@ -1326,50 +1326,15 @@ impl McpServer {
         })?;
 
         let exts = veles_core::walker::filter_extensions(None, manifest.include_text_files);
-        let on_disk: std::collections::HashMap<String, (std::path::PathBuf, u64, i64)> =
-            veles_core::walker::walk_files(repo_path, &exts)
-                .filter_map(|abs| {
-                    let rel = abs
-                        .strip_prefix(repo_path)
-                        .ok()?
-                        .to_string_lossy()
-                        .into_owned();
-                    let meta = std::fs::metadata(&abs).ok()?;
-                    let mtime = meta
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    Some((rel, (abs, meta.len(), mtime)))
-                })
-                .collect();
+        // Shared classification (§3.3) — same code path as
+        // VelesIndex::update_from_path, so `status` and `update` are
+        // guaranteed to agree on counts.
+        let state = veles_core::persist::classify_disk(repo_path, &manifest, &exts);
 
-        // Mirror `VelesIndex::update_from_path` classification so a stale
-        // mtime alone (touch / git checkout of identical bytes) doesn't
-        // produce a false-positive "modified" count.
-        let mut added = 0usize;
-        let mut modified = 0usize;
-        let mut mtime_only = 0usize;
-        for (rel, (abs, size, mtime)) in &on_disk {
-            match manifest.files.get(rel) {
-                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {}
-                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
-                    match veles_core::persist::content_hash(abs) {
-                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => mtime_only += 1,
-                        Ok(_) | Err(_) => modified += 1,
-                    }
-                }
-                Some(_) => modified += 1,
-                None => added += 1,
-            }
-        }
-        let removed = manifest
-            .files
-            .keys()
-            .filter(|k| !on_disk.contains_key(*k))
-            .count();
+        let added = state.count_added();
+        let modified = state.count_modified();
+        let mtime_only = state.count_mtime_only();
+        let removed = state.count_removed();
 
         let mut lines: Vec<String> = vec![
             format!("Index at {}/.veles", repo_path.display()),
@@ -1382,7 +1347,7 @@ impl McpServer {
             format!("  total chunks     : {}", manifest.total_chunks),
             String::new(),
             "On-disk diff:".to_string(),
-            format!("  files seen now   : {}", on_disk.len()),
+            format!("  files seen now   : {}", state.seen_now()),
             format!("  added            : {added}"),
             format!("  modified         : {modified}"),
             format!("  removed          : {removed}"),
