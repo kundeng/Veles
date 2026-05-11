@@ -54,3 +54,11 @@ veles-mcp = { path = "crates/veles-mcp", version = "0.4.5" }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Bench profile: match what users see from `cargo install veles-cli`.
+# `lto = "thin"` matches the dist profile; `codegen-units = 1` reduces
+# Criterion outlier variance at the cost of longer compile times.
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
