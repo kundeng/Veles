@@ -23,6 +23,7 @@ blake3 = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
 ahash = { version = "0.8", features = ["serde"] }
+dashmap = { workspace = true }
 bincode = { workspace = true }
 
 # Tree-sitter for symbol extraction

@@ -7,9 +7,11 @@
 
 use ahash::AHashMap;
 use ahash::AHashSet;
+use dashmap::DashMap;
+use rayon::prelude::*;
 use regex::Regex;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::tokenizer::split_identifier;
 use crate::types::Chunk;
@@ -53,6 +55,15 @@ static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}_][\p{L}\
 const EMBEDDED_STEM_MIN_LEN: usize = 4;
 /// Half-strength for embedded symbols.
 const EMBEDDED_SYMBOL_BOOST_SCALE: f64 = 0.5;
+
+/// Minimum chunk count before def-boost loops fan out via rayon.
+///
+/// Below this, the per-chunk work (substring filter — usually a fast
+/// reject — plus an occasional regex match) is dominated by rayon's
+/// spawn / join overhead (~10–50 µs end-to-end). Above it, the regex
+/// work per matching chunk dwarfs the overhead and parallelism wins
+/// linearly. Mirrors `index::dense::PARALLEL_THRESHOLD` (1024).
+const PARALLEL_BOOST_THRESHOLD: usize = 1024;
 
 /// Definition keywords across common languages.
 const DEFINITION_KEYWORDS: &[&str] = &[
@@ -241,38 +252,39 @@ static DEF_SQL_BODY: LazyLock<String> = LazyLock::new(|| {
 
 /// Process-wide cache of compiled `DefPattern`s keyed by symbol name.
 ///
-/// `RwLock` so concurrent reads (cache hits) don't block each other —
-/// only the rare miss (first time we see a new symbol) takes the write
-/// path. The cache is unbounded: in practice users search for tens of
-/// distinct symbols per session, and each `DefPattern` is a few KB of
-/// regex DFA — bounded growth even on long-running MCP / gRPC servers.
-/// Switch to LRU if a session ever sustains thousands of unique symbol
-/// queries (it won't).
-static DEF_PATTERN_CACHE: LazyLock<RwLock<AHashMap<String, Arc<DefPattern>>>> =
-    LazyLock::new(|| RwLock::new(AHashMap::with_capacity(64)));
+/// Lockfree-ish: `DashMap` shards the map internally, so concurrent
+/// reads on different shards never contend. Reads in the common case
+/// (cache hit) take a per-shard read lock that's effectively atomic.
+/// Writes (first compile of a symbol) lock only their own shard.
+///
+/// Unbounded: in practice users search for tens of distinct symbols
+/// per session, and each `DefPattern` is a few KB of regex DFA —
+/// bounded growth even on long-running MCP / gRPC servers. Switch to
+/// LRU if a session ever sustains thousands of unique symbol queries
+/// (it won't).
+static DEF_PATTERN_CACHE: LazyLock<DashMap<String, Arc<DefPattern>>> =
+    LazyLock::new(|| DashMap::with_capacity(64));
 
 /// Get (or build, on first call) the `DefPattern` for `symbol_name`.
 ///
 /// Returns `Arc<DefPattern>` so callers can fan out across many chunks
-/// without holding the cache lock and without cloning the underlying
-/// regexes (an `Arc::clone` is one atomic op).
+/// (including via rayon — see §1.4) without holding any cache reference
+/// and without cloning the underlying regexes (an `Arc::clone` is one
+/// atomic op).
 pub(crate) fn definition_pattern(symbol_name: &str) -> Arc<DefPattern> {
-    // Fast path: shared read lock, hit.
-    if let Ok(cache) = DEF_PATTERN_CACHE.read()
-        && let Some(p) = cache.get(symbol_name)
-    {
-        return Arc::clone(p);
+    // Fast path: shard read, hit.
+    if let Some(p) = DEF_PATTERN_CACHE.get(symbol_name) {
+        return Arc::clone(p.value());
     }
-    // Slow path: compile outside the lock to avoid blocking other readers,
-    // then take a write lock and insert. Re-check under the write lock in
-    // case another thread compiled the same name concurrently.
+    // Slow path: compile outside any lock so peer readers stay unblocked,
+    // then insert via DashMap's CAS-style entry API. If a concurrent
+    // thread won the race, `or_insert_with` will pick up the existing
+    // value rather than overwriting.
     let built = Arc::new(build_def_pattern(symbol_name));
-    let mut cache = DEF_PATTERN_CACHE.write().expect("DEF_PATTERN_CACHE poisoned");
-    if let Some(existing) = cache.get(symbol_name) {
-        return Arc::clone(existing);
-    }
-    cache.insert(symbol_name.to_string(), Arc::clone(&built));
-    built
+    let entry = DEF_PATTERN_CACHE
+        .entry(symbol_name.to_string())
+        .or_insert(built);
+    Arc::clone(entry.value())
 }
 
 fn build_def_pattern(symbol_name: &str) -> DefPattern {
@@ -359,16 +371,35 @@ fn boost_symbol_definitions(scores: &mut [f64], query: &str, max_score: f64, chu
     // BM25 buries the definition site under reference-heavy chunks; the
     // unconditional scan is what makes the definition boost actually fire.
     //
-    // The substring pre-filter keeps this O(N) loop cheap on large repos:
-    // most chunks don't mention the symbol at all, and `String::contains`
-    // short-circuits in microseconds.
-    for (i, chunk) in chunks.iter().enumerate() {
-        if !names.iter().any(|n| chunk.content.contains(n)) {
-            continue;
-        }
-        let tier = definition_tier(chunk, &matchers, boost_unit);
-        if tier > 0.0 {
+    // Parallelised via rayon (§1.4) above PARALLEL_BOOST_THRESHOLD. Below
+    // it, sparse-match queries (rare identifiers where the substring
+    // filter rejects almost every chunk) pay rayon spawn overhead for
+    // microseconds of actual work — net regression. Above it, the regex
+    // work dominates and parallel wins linearly with N.
+    if chunks.len() >= PARALLEL_BOOST_THRESHOLD {
+        let updates: Vec<(usize, f64)> = chunks
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, chunk)| {
+                if !names.iter().any(|n| chunk.content.contains(n)) {
+                    return None;
+                }
+                let tier = definition_tier(chunk, &matchers, boost_unit);
+                if tier > 0.0 { Some((i, tier)) } else { None }
+            })
+            .collect();
+        for (i, tier) in updates {
             scores[i] += tier;
+        }
+    } else {
+        for (i, chunk) in chunks.iter().enumerate() {
+            if !names.iter().any(|n| chunk.content.contains(n)) {
+                continue;
+            }
+            let tier = definition_tier(chunk, &matchers, boost_unit);
+            if tier > 0.0 {
+                scores[i] += tier;
+            }
         }
     }
 }
@@ -386,33 +417,60 @@ fn boost_embedded_symbols(scores: &mut [f64], query: &str, max_score: f64, chunk
     let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER * EMBEDDED_SYMBOL_BOOST_SCALE;
     let symbols_lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();
 
-    for (i, chunk) in chunks.iter().enumerate() {
-        let in_pool = scores[i] > 0.0;
-        if in_pool {
-            let tier = definition_tier(chunk, &matchers, boost_unit);
-            if tier > 0.0 {
-                scores[i] += tier;
-            }
-        } else {
-            // Non-candidate scan.
-            let stem = file_stem_lower(&chunk.file_path);
-            let stem_norm = stem.replace('_', "");
-            let matches = symbols_lower.iter().any(|sym_lower| {
-                stem == *sym_lower
-                    || stem_norm == *sym_lower
-                    || (stem.len() >= EMBEDDED_STEM_MIN_LEN && sym_lower.starts_with(&stem))
-                    || (stem_norm.len() >= EMBEDDED_STEM_MIN_LEN
-                        && sym_lower.starts_with(&stem_norm))
-            });
-            if !matches {
-                continue;
-            }
-            let tier = definition_tier(chunk, &matchers, boost_unit);
+    // Threshold-gated parallel scan (§1.4) — see `boost_symbol_definitions`
+    // for the rationale. The parallel branch reads `scores[i]` via an
+    // immutable reborrow and collects writes as `(idx, tier)`; the
+    // serial branch reads + writes scores directly.
+    if chunks.len() >= PARALLEL_BOOST_THRESHOLD {
+        let scores_view: &[f64] = scores;
+        let updates: Vec<(usize, f64)> = chunks
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, chunk)| {
+                let in_pool = scores_view[i] > 0.0;
+                let tier = if in_pool {
+                    definition_tier(chunk, &matchers, boost_unit)
+                } else {
+                    if !embedded_stem_matches(&chunk.file_path, &symbols_lower) {
+                        return None;
+                    }
+                    definition_tier(chunk, &matchers, boost_unit)
+                };
+                if tier > 0.0 { Some((i, tier)) } else { None }
+            })
+            .collect();
+        for (i, tier) in updates {
+            scores[i] += tier;
+        }
+    } else {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let in_pool = scores[i] > 0.0;
+            let tier = if in_pool {
+                definition_tier(chunk, &matchers, boost_unit)
+            } else {
+                if !embedded_stem_matches(&chunk.file_path, &symbols_lower) {
+                    continue;
+                }
+                definition_tier(chunk, &matchers, boost_unit)
+            };
             if tier > 0.0 {
                 scores[i] += tier;
             }
         }
     }
+}
+
+/// File-stem gate for `boost_embedded_symbols` non-candidate scan.
+/// Pulled out so the parallel and serial branches stay in sync.
+fn embedded_stem_matches(file_path: &str, symbols_lower: &[String]) -> bool {
+    let stem = file_stem_lower(file_path);
+    let stem_norm = stem.replace('_', "");
+    symbols_lower.iter().any(|sym_lower| {
+        stem == *sym_lower
+            || stem_norm == *sym_lower
+            || (stem.len() >= EMBEDDED_STEM_MIN_LEN && sym_lower.starts_with(&stem))
+            || (stem_norm.len() >= EMBEDDED_STEM_MIN_LEN && sym_lower.starts_with(&stem_norm))
+    })
 }
 
 fn boost_stem_matches(scores: &mut [f64], query: &str, max_score: f64, chunks: &[Chunk]) {
