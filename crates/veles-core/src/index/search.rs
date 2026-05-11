@@ -5,11 +5,19 @@
 
 use crate::index::dense::DenseIndex;
 use crate::index::sparse::Bm25Index;
-use crate::ranking::{apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha};
+use crate::ranking::{
+    apply_query_boost, boost_multi_chunk_files, is_symbol_query, rerank_topk, resolve_alpha,
+};
 use crate::tokenizer::tokenize;
 use crate::types::{Chunk, SearchMode, SearchResult};
 
 const RRF_K: f64 = 60.0;
+
+/// How many candidates the pure (non-hybrid) modes pull before reranking.
+/// The rerank pipeline (path penalties + per-file saturation decay) needs
+/// headroom to actually shuffle results — 5× matches what hybrid uses
+/// internally for each side of the fusion.
+const PURE_MODE_CANDIDATE_OVERSHOOT: usize = 5;
 
 /// Common short-circuit guard for all three search modes.
 ///
@@ -35,6 +43,13 @@ fn fill_rrf(out: &mut [f64], ranked: &[(usize, f64)]) {
 }
 
 /// Run semantic (dense) search for a query.
+///
+/// Over-fetches a candidate pool, then runs the same boost + rerank pipeline
+/// as hybrid search so path penalties (test files, `__init__.py`, compat
+/// directories) and definition boosts apply uniformly across modes. Without
+/// this, pure semantic mode tends to surface short generic test chunks for
+/// short identifier queries because static embeddings have weak signal at
+/// that granularity.
 pub fn search_semantic(
     query: &str,
     model: &model2vec_rs::model::StaticModel,
@@ -48,20 +63,30 @@ pub fn search_semantic(
     }
     let query_embedding = model.encode(&[query.to_string()]);
     let query_vec = &query_embedding[0];
-    let (indices, similarities) = dense_index.query(query_vec, top_k, selector);
 
-    indices
-        .into_iter()
-        .zip(similarities)
-        .map(|(index, similarity)| SearchResult {
-            chunk: chunks[index].clone(),
-            score: similarity as f64,
-            source: SearchMode::Semantic,
-        })
-        .collect()
+    let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
+    let (indices, similarities) = dense_index.query(query_vec, candidate_count, selector);
+
+    let mut scores = vec![0.0f64; chunks.len()];
+    for (idx, sim) in indices.iter().zip(similarities.iter()) {
+        if *idx < scores.len() {
+            scores[*idx] = *sim as f64;
+        }
+    }
+
+    finalize_pure_mode(scores, query, chunks, top_k, SearchMode::Semantic)
 }
 
 /// Run BM25 (sparse) search for a query.
+///
+/// Bare-identifier queries match against the whole token only — splitting
+/// `handle_refs` into `[handle_refs, handle, refs]` lets chunks that
+/// reference many `handle_*` functions outrank the chunk that actually
+/// defines `handle_refs`. The index still stores sub-tokens, so other
+/// queries that just say `handle` continue to match.
+///
+/// After scoring, the same boost + rerank pipeline as hybrid runs so the
+/// definition site is lifted and test/compat paths are demoted.
 pub fn search_bm25(
     query: &str,
     bm25_index: &Bm25Index,
@@ -72,19 +97,62 @@ pub fn search_bm25(
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
-    let tokens = tokenize(query);
+    let tokens = bm25_query_tokens(query);
     if tokens.is_empty() {
         // Non-whitespace query that still yields no tokens (e.g. all
         // punctuation) — BM25 has nothing to score against, so bail out.
         return Vec::new();
     }
-    let results = bm25_index.top_k(&tokens, top_k, selector);
-    results
+
+    let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
+    let raw = bm25_index.top_k(&tokens, candidate_count, selector);
+
+    let mut scores = vec![0.0f64; chunks.len()];
+    for (idx, score) in &raw {
+        if *idx < scores.len() {
+            scores[*idx] = *score;
+        }
+    }
+
+    finalize_pure_mode(scores, query, chunks, top_k, SearchMode::Bm25)
+}
+
+/// Tokenize a query for BM25 lookup.
+///
+/// Bare-identifier queries skip sub-token splitting so `handle_refs` only
+/// matches `handle_refs`, not every chunk that mentions `handle`. Natural-
+/// language queries fall through to the standard splitter.
+fn bm25_query_tokens(query: &str) -> Vec<String> {
+    if is_symbol_query(query) {
+        let trimmed = query.trim().to_lowercase();
+        if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![trimmed]
+        }
+    } else {
+        tokenize(query)
+    }
+}
+
+/// Apply boost + rerank to a raw-scored candidate pool and materialise the
+/// top-k as `SearchResult`s. Shared between `search_bm25` and `search_semantic`.
+fn finalize_pure_mode(
+    mut scores: Vec<f64>,
+    query: &str,
+    chunks: &[Chunk],
+    top_k: usize,
+    source: SearchMode,
+) -> Vec<SearchResult> {
+    boost_multi_chunk_files(&mut scores, chunks);
+    apply_query_boost(&mut scores, query, chunks);
+    let ranked = rerank_topk(&scores, chunks, top_k, true);
+    ranked
         .into_iter()
         .map(|(idx, score)| SearchResult {
             chunk: chunks[idx].clone(),
             score,
-            source: SearchMode::Bm25,
+            source,
         })
         .collect()
 }
