@@ -144,8 +144,9 @@ async fn main() -> Result<()> {
             watch,
             dashboard,
             dashboard_port,
+            dashboard_open,
             ..
-        }) => handlers::handle_serve_mcp(watch, dashboard, dashboard_port).await,
+        }) => handlers::handle_serve_mcp(watch, dashboard, dashboard_port, dashboard_open).await,
 
         None => handlers::handle_default().await,
     }

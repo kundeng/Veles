@@ -182,9 +182,15 @@ pub enum Commands {
         /// on a localhost port. Requires a build with `--features dashboard`.
         #[arg(long)]
         dashboard: bool,
-        /// Dashboard port (0 = OS-chosen free port; the URL is logged).
+        /// Dashboard port (0 = OS-chosen free port; the URL is logged). Also
+        /// the singleton election token: the process that binds it owns
+        /// watching + the dashboard; a second veles follows instead of
+        /// fighting for the port.
         #[arg(long, default_value_t = 0)]
         dashboard_port: u16,
+        /// Open the dashboard URL in a browser on startup (owner only, once).
+        #[arg(long)]
+        dashboard_open: bool,
     },
 
     /// List definitions in a single file (functions, structs, classes, ...).

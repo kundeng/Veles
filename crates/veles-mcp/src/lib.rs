@@ -451,6 +451,30 @@ fn tools() -> Vec<Tool> {
 
 // ── MCP Server ───────────────────────────────────────────────────────────
 
+/// Open `url` in the user's default browser, best-effort. Used by the owner
+/// when `--dashboard-open` is set. Spawns the platform opener and returns
+/// immediately; any failure is logged, never fatal.
+#[cfg(feature = "dashboard")]
+fn open_browser(url: &str) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    match cmd.spawn() {
+        Ok(_) => eprintln!("veles dashboard: opening {url}"),
+        Err(e) => eprintln!("veles dashboard: could not open browser ({e}); visit {url}"),
+    }
+}
+
 pub struct McpServer {
     cache: Arc<veles_core::cache::IndexCache>,
     server_info: Value,
@@ -460,6 +484,21 @@ pub struct McpServer {
     /// Live activity feed (searches, auto-updates). Consumed by the
     /// dashboard's SSE endpoint; a no-op broadcast when nothing subscribes.
     events: tokio::sync::broadcast::Sender<String>,
+    /// Singleton election result. `true` = this process owns the dashboard
+    /// port, and therefore owns watching + updating the indexes; `false` =
+    /// another veles instance owns it and we run as a follower (no watcher,
+    /// no dashboard — we reload persisted indexes on read instead). Defaults
+    /// to `true` so non-dashboard builds and the lone-process case behave as
+    /// before. `Arc<Atomic>` because a follower can self-promote to owner
+    /// from a shared-`&self` request path when the previous owner exits.
+    owner: Arc<std::sync::atomic::AtomicBool>,
+    /// Dashboard config remembered for self-promotion (re-binding the port).
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    dashboard_enabled: bool,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    dashboard_port: u16,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    dashboard_open: bool,
 }
 
 impl McpServer {
@@ -473,6 +512,10 @@ impl McpServer {
             }),
             watch: None,
             events,
+            owner: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            dashboard_enabled: false,
+            dashboard_port: 0,
+            dashboard_open: false,
         }
     }
 
@@ -490,18 +533,65 @@ impl McpServer {
     }
 
     /// Enable the optional per-repo web dashboard (`serve-mcp --dashboard`).
-    /// Binds a localhost port (0 = OS-chosen free port) and logs the URL.
+    ///
+    /// The dashboard port doubles as a **singleton election token**: the first
+    /// veles process to bind it becomes the *owner* (it watches + updates the
+    /// indexes and serves the dashboard); a second veles process finds the
+    /// port held by another veles and runs as a *follower* — no second
+    /// watcher, no second dashboard, no port fight. (If the port is held by an
+    /// unrelated service, we fall back to a free port and still own a
+    /// dashboard.) `open` makes the owner open the URL in a browser once.
+    ///
     /// Requires the `dashboard` build feature; otherwise prints a notice.
-    pub fn with_dashboard(self, enabled: bool, port: u16) -> Self {
-        let _ = port; // used only in the `dashboard` feature build
+    pub fn with_dashboard(mut self, enabled: bool, port: u16, open: bool) -> Self {
+        self.dashboard_enabled = enabled;
+        self.dashboard_port = port;
+        self.dashboard_open = open;
+        let _ = open; // used only in the `dashboard` feature build
         if enabled {
             #[cfg(feature = "dashboard")]
-            dashboard::spawn(
-                self.cache.clone(),
-                self.watch.clone(),
-                self.events.clone(),
-                port,
-            );
+            match dashboard::elect(port) {
+                dashboard::Election::Owner(listener, addr) => {
+                    eprintln!("veles dashboard: http://{addr}");
+                    dashboard::serve(
+                        listener,
+                        self.cache.clone(),
+                        self.watch.clone(),
+                        self.events.clone(),
+                    );
+                    if open {
+                        open_browser(&format!("http://{addr}"));
+                    }
+                }
+                dashboard::Election::FollowAnotherVeles => {
+                    self.owner.store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "veles dashboard: another veles already owns :{port}; running as a \
+                         follower (no dashboard, no watcher — reload-on-read keeps search fresh)"
+                    );
+                }
+                dashboard::Election::Foreign => {
+                    // Port squatted by a non-veles service: take a free port so
+                    // we still get a dashboard, and stay owner.
+                    if let dashboard::Election::Owner(listener, addr) = dashboard::elect(0) {
+                        eprintln!(
+                            "veles dashboard: :{port} held by a non-veles service; \
+                             serving on http://{addr} instead"
+                        );
+                        dashboard::serve(
+                            listener,
+                            self.cache.clone(),
+                            self.watch.clone(),
+                            self.events.clone(),
+                        );
+                        if open {
+                            open_browser(&format!("http://{addr}"));
+                        }
+                    } else {
+                        eprintln!("veles dashboard: could not bind any port; UI disabled");
+                    }
+                }
+            }
             #[cfg(not(feature = "dashboard"))]
             eprintln!(
                 "veles dashboard: this binary was built without the `dashboard` feature; \
@@ -511,22 +601,77 @@ impl McpServer {
         self
     }
 
+    /// Self-heal: when a follower handles a request, check whether the owner's
+    /// dashboard port has become free (the owner exited). If so, take it over
+    /// — bind the port, start the dashboard, and begin watching every repo
+    /// already loaded — so exactly one live process is always the owner.
+    #[cfg(feature = "dashboard")]
+    fn try_promote(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.dashboard_enabled || self.owner.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((listener, addr)) = dashboard::try_become_owner(self.dashboard_port) else {
+            return; // still owned by someone — stay a follower
+        };
+        // We hold the port. Claim ownership exactly once.
+        if self
+            .owner
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            eprintln!("veles dashboard: previous owner gone — promoting to owner at http://{addr}");
+            dashboard::serve(
+                listener,
+                self.cache.clone(),
+                self.watch.clone(),
+                self.events.clone(),
+            );
+            if let Some(w) = &self.watch {
+                for repo in self.cache.loaded_repos() {
+                    w.watch(&repo);
+                }
+            }
+        }
+        // If the CAS lost, another task promoted first; dropping `listener`
+        // frees the port — harmless, the winner already holds its own bind.
+    }
+
+    #[cfg(not(feature = "dashboard"))]
+    fn try_promote(&self) {}
+
     /// Publish a one-line activity event to the dashboard feed (best-effort).
     fn emit(&self, msg: impl Into<String>) {
         let _ = self.events.send(msg.into());
     }
 
-    /// Load (or build) the index for `repo` and, when watching is enabled,
-    /// register it so subsequent on-disk edits refresh it automatically.
+    /// Load (or build) the index for `repo`.
+    ///
+    /// **Owner** processes register the repo with the watcher so on-disk edits
+    /// refresh it automatically. **Follower** processes (another veles owns
+    /// updating this index) don't watch — they `refresh_if_stale` first, so a
+    /// search reloads the persisted index the owner just rewrote without
+    /// re-embedding. A follower also attempts to self-promote here in case the
+    /// owner has exited.
     async fn load_repo(
         &self,
         repo: &str,
     ) -> Result<Arc<tokio::sync::RwLock<veles_core::VelesIndex>>> {
-        let index = self.cache.get_or_load(repo, false).await?;
-        if let Some(w) = &self.watch {
-            w.watch(repo);
+        use std::sync::atomic::Ordering;
+        if !self.owner.load(Ordering::Relaxed) {
+            self.try_promote();
         }
-        Ok(index)
+        if self.owner.load(Ordering::Relaxed) {
+            let index = self.cache.get_or_load(repo, false).await?;
+            if let Some(w) = &self.watch {
+                w.watch(repo);
+            }
+            Ok(index)
+        } else {
+            // Follower: pick up any update the owner persisted since we loaded.
+            self.cache.refresh_if_stale(repo);
+            self.cache.get_or_load(repo, false).await
+        }
     }
 
     /// Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
