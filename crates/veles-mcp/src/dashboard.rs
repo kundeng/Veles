@@ -35,9 +35,11 @@ struct DashState {
 }
 
 /// Start the dashboard HTTP server on `127.0.0.1:port` (port 0 = OS-chosen
-/// free port). Spawns onto the current runtime; returns once bound so the
-/// URL can be logged. Errors are reported to stderr and are non-fatal — the
-/// MCP server runs fine without the UI.
+/// free port). If a non-zero `port` is already in use, falls back to an
+/// OS-chosen free port so concurrent MCP instances each get their own
+/// dashboard rather than fighting over one port. Spawns onto the current
+/// runtime; the actual bound URL is logged to stderr. Errors are non-fatal
+/// — the MCP server runs fine without the UI.
 pub fn spawn(
     cache: Arc<IndexCache>,
     watch: Option<Arc<WatchManager>>,
@@ -56,8 +58,27 @@ pub fn spawn(
             .route("/api/events", get(events_sse))
             .with_state(state);
 
+        // Bind the requested port; if it's already taken — the common case
+        // when a second MCP instance starts, since each agent runs its own
+        // server — fall back to an OS-chosen free port instead of giving up
+        // the dashboard entirely. This keeps the primary agent on a
+        // predictable, bookmarkable port while every additional agent still
+        // gets a working dashboard on its own port. No conflict, no headless
+        // degradation.
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
             Ok(l) => l,
+            Err(e) if port != 0 => {
+                eprintln!(
+                    "veles dashboard: port {port} unavailable ({e}); retrying on a free port"
+                );
+                match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                    Ok(l) => l,
+                    Err(e2) => {
+                        eprintln!("veles dashboard: could not bind a free port: {e2}");
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("veles dashboard: could not bind 127.0.0.1:{port}: {e}");
                 return;
