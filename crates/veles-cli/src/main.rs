@@ -140,7 +140,12 @@ async fn main() -> Result<()> {
 
         Some(Commands::ServeGrpc { addr }) => handlers::handle_serve_grpc(addr).await,
 
-        Some(Commands::ServeMcp { watch, .. }) => handlers::handle_serve_mcp(watch).await,
+        Some(Commands::ServeMcp {
+            watch,
+            dashboard,
+            dashboard_port,
+            ..
+        }) => handlers::handle_serve_mcp(watch, dashboard, dashboard_port).await,
 
         None => handlers::handle_default().await,
     }

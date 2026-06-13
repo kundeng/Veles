@@ -43,8 +43,13 @@ pub struct WatchManager {
 }
 
 impl WatchManager {
-    /// Build the watcher and spawn the async update consumer.
-    pub fn new(cache: Arc<IndexCache>) -> Result<Arc<Self>> {
+    /// Build the watcher and spawn the async update consumer. `events`
+    /// receives a one-line message after each applied update (for the
+    /// dashboard feed); it is fine for it to have no subscribers.
+    pub fn new(
+        cache: Arc<IndexCache>,
+        events: tokio::sync::broadcast::Sender<String>,
+    ) -> Result<Arc<Self>> {
         let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
         let watched: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -97,13 +102,17 @@ impl WatchManager {
                     let mut idx = idx_arc.write().await;
                     match idx.update_from_path(&root) {
                         Ok(report) if !report.is_noop() => match idx.save(&root) {
-                            Ok(()) => eprintln!(
-                                "veles watch: updated {key} (+{} ~{} -{}, {} chunks)",
-                                report.added_files,
-                                report.modified_files,
-                                report.removed_files,
-                                report.total_chunks
-                            ),
+                            Ok(()) => {
+                                let msg = format!(
+                                    "updated {key} (+{} ~{} -{}, {} chunks)",
+                                    report.added_files,
+                                    report.modified_files,
+                                    report.removed_files,
+                                    report.total_chunks
+                                );
+                                eprintln!("veles watch: {msg}");
+                                let _ = events.send(msg);
+                            }
                             Err(e) => eprintln!("veles watch: save failed for {key}: {e}"),
                         },
                         Ok(_) => {} // no real change
@@ -152,6 +161,7 @@ impl WatchManager {
     }
 
     /// Repos currently watched (canonical paths) — for the dashboard.
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     pub fn watched_roots(&self) -> Vec<PathBuf> {
         self.watched.lock().unwrap().keys().cloned().collect()
     }
@@ -198,7 +208,8 @@ mod tests {
         // Prime the cache the way a first `search` would.
         cache.get_or_load(&repo, false).await.unwrap();
 
-        let wm = WatchManager::new(cache.clone()).expect("watch manager");
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        let wm = WatchManager::new(cache.clone(), events).expect("watch manager");
         wm.watch(&repo);
 
         // Add a new file *after* watching has started.

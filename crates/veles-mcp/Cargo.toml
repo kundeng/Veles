@@ -19,6 +19,14 @@ regex = { workspace = true }
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 
+# Optional per-repo web dashboard (off by default to keep the binary lean).
+axum = { version = "0.7", optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+
+[features]
+# Build a per-repo web dashboard served from `serve-mcp --dashboard`.
+dashboard = ["dep:axum", "dep:tokio-stream", "tokio/net", "tokio/rt-multi-thread"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["test-util", "macros"] }

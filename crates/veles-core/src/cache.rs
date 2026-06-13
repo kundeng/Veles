@@ -150,6 +150,12 @@ impl IndexCache {
         self.entries.remove(repo).is_some()
     }
 
+    /// Keys (repo identifiers) of all currently-cached repos. Used by the
+    /// MCP dashboard to enumerate what this server has loaded.
+    pub fn loaded_repos(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Current number of cached repos.
     pub fn len(&self) -> usize {
         self.entries.len()

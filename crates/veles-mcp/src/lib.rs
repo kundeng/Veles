@@ -79,6 +79,8 @@ use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
 
 mod watch;
+#[cfg(feature = "dashboard")]
+mod dashboard;
 
 // ── JSON-RPC Types ────────────────────────────────────────────────────────
 
@@ -455,10 +457,14 @@ pub struct McpServer {
     /// Present only when `--watch` is enabled; keeps cached indexes fresh
     /// by running incremental updates on filesystem changes.
     watch: Option<Arc<watch::WatchManager>>,
+    /// Live activity feed (searches, auto-updates). Consumed by the
+    /// dashboard's SSE endpoint; a no-op broadcast when nothing subscribes.
+    events: tokio::sync::broadcast::Sender<String>,
 }
 
 impl McpServer {
     pub fn new(model: model2vec_rs::model::StaticModel) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(256);
         Self {
             cache: Arc::new(veles_core::cache::IndexCache::new(model)),
             server_info: json!({
@@ -466,6 +472,7 @@ impl McpServer {
                 "version": env!("CARGO_PKG_VERSION"),
             }),
             watch: None,
+            events,
         }
     }
 
@@ -474,12 +481,39 @@ impl McpServer {
     /// as files change — so search never serves a stale index. Off by default.
     pub fn with_watch(mut self, enabled: bool) -> Self {
         if enabled && self.watch.is_none() {
-            match watch::WatchManager::new(self.cache.clone()) {
+            match watch::WatchManager::new(self.cache.clone(), self.events.clone()) {
                 Ok(w) => self.watch = Some(w),
                 Err(e) => eprintln!("veles watch: failed to start watcher: {e}"),
             }
         }
         self
+    }
+
+    /// Enable the optional per-repo web dashboard (`serve-mcp --dashboard`).
+    /// Binds a localhost port (0 = OS-chosen free port) and logs the URL.
+    /// Requires the `dashboard` build feature; otherwise prints a notice.
+    pub fn with_dashboard(self, enabled: bool, port: u16) -> Self {
+        let _ = port; // used only in the `dashboard` feature build
+        if enabled {
+            #[cfg(feature = "dashboard")]
+            dashboard::spawn(
+                self.cache.clone(),
+                self.watch.clone(),
+                self.events.clone(),
+                port,
+            );
+            #[cfg(not(feature = "dashboard"))]
+            eprintln!(
+                "veles dashboard: this binary was built without the `dashboard` feature; \
+                 rebuild with `--features dashboard` to enable the web UI."
+            );
+        }
+        self
+    }
+
+    /// Publish a one-line activity event to the dashboard feed (best-effort).
+    fn emit(&self, msg: impl Into<String>) {
+        let _ = self.events.send(msg.into());
     }
 
     /// Load (or build) the index for `repo` and, when watching is enabled,
@@ -636,6 +670,7 @@ impl McpServer {
         })?;
 
         let repo = args["repo"].as_str().unwrap_or(".");
+        self.emit(format!("search: {query:?} in {repo}"));
 
         let mode_str = args["mode"].as_str().unwrap_or("hybrid");
         let mode = mode_str.parse::<SearchMode>().unwrap_or(SearchMode::Hybrid);

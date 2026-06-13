@@ -28,3 +28,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 crossbeam-channel = "0.5"
 unicode-width = "0.2"
+
+[features]
+# Compile in the optional per-repo web dashboard (`serve-mcp --dashboard`).
+dashboard = ["veles-mcp/dashboard"]

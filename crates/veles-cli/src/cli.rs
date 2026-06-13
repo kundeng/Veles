@@ -178,6 +178,13 @@ pub enum Commands {
         /// a session. Debounced; ignores `.veles/` and standard heavy dirs.
         #[arg(long)]
         watch: bool,
+        /// Serve a per-repo web dashboard (index health + live activity feed)
+        /// on a localhost port. Requires a build with `--features dashboard`.
+        #[arg(long)]
+        dashboard: bool,
+        /// Dashboard port (0 = OS-chosen free port; the URL is logged).
+        #[arg(long, default_value_t = 0)]
+        dashboard_port: u16,
     },
 
     /// List definitions in a single file (functions, structs, classes, ...).
