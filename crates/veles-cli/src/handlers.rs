@@ -461,9 +461,9 @@ pub async fn handle_serve_grpc(addr: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_serve_mcp() -> Result<()> {
+pub async fn handle_serve_mcp(watch: bool) -> Result<()> {
     let mdl = model::load_model(None)?;
-    let server = veles_mcp::McpServer::new(mdl);
+    let server = veles_mcp::McpServer::new(mdl).with_watch(watch);
     server.run().await?;
     Ok(())
 }
@@ -484,7 +484,7 @@ pub async fn handle_default() -> Result<()> {
         println!();
         Ok(())
     } else {
-        handle_serve_mcp().await
+        handle_serve_mcp(false).await
     }
 }
 

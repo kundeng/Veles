@@ -173,6 +173,11 @@ pub enum Commands {
         /// Also index non-code text files.
         #[arg(long)]
         include_text_files: bool,
+        /// Watch each opened repo and incrementally refresh its index when
+        /// files change on disk, so search never serves a stale index within
+        /// a session. Debounced; ignores `.veles/` and standard heavy dirs.
+        #[arg(long)]
+        watch: bool,
     },
 
     /// List definitions in a single file (functions, structs, classes, ...).

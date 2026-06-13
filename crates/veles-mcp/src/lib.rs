@@ -78,6 +78,8 @@ use veles_core::filter;
 use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
 
+mod watch;
+
 // ── JSON-RPC Types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -450,6 +452,9 @@ fn tools() -> Vec<Tool> {
 pub struct McpServer {
     cache: Arc<veles_core::cache::IndexCache>,
     server_info: Value,
+    /// Present only when `--watch` is enabled; keeps cached indexes fresh
+    /// by running incremental updates on filesystem changes.
+    watch: Option<Arc<watch::WatchManager>>,
 }
 
 impl McpServer {
@@ -460,7 +465,34 @@ impl McpServer {
                 "name": "veles",
                 "version": env!("CARGO_PKG_VERSION"),
             }),
+            watch: None,
         }
+    }
+
+    /// Enable filesystem auto-update. When on, every repo opened in this
+    /// session is watched and its index incrementally refreshed (debounced)
+    /// as files change — so search never serves a stale index. Off by default.
+    pub fn with_watch(mut self, enabled: bool) -> Self {
+        if enabled && self.watch.is_none() {
+            match watch::WatchManager::new(self.cache.clone()) {
+                Ok(w) => self.watch = Some(w),
+                Err(e) => eprintln!("veles watch: failed to start watcher: {e}"),
+            }
+        }
+        self
+    }
+
+    /// Load (or build) the index for `repo` and, when watching is enabled,
+    /// register it so subsequent on-disk edits refresh it automatically.
+    async fn load_repo(
+        &self,
+        repo: &str,
+    ) -> Result<Arc<tokio::sync::RwLock<veles_core::VelesIndex>>> {
+        let index = self.cache.get_or_load(repo, false).await?;
+        if let Some(w) = &self.watch {
+            w.watch(repo);
+        }
+        Ok(index)
     }
 
     /// Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
@@ -616,9 +648,7 @@ impl McpServer {
         let min_score = args["min_score"].as_f64();
         let format = args["format"].as_str().unwrap_or("default");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -671,9 +701,7 @@ impl McpServer {
         let lang = string_array(&args, "lang");
         let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -718,9 +746,7 @@ impl McpServer {
         })?;
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -754,9 +780,7 @@ impl McpServer {
         let top_k = args["top_k"].as_u64().unwrap_or(10) as usize;
         let format = args["format"].as_str().unwrap_or("default");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -877,9 +901,7 @@ impl McpServer {
     async fn handle_stats(&self, args: Value) -> Result<Value, JsonRpcError> {
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -934,9 +956,7 @@ impl McpServer {
         }
         let path_buf = path.to_path_buf();
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -998,9 +1018,7 @@ impl McpServer {
         let exclude_globs = string_array(&args, "exclude");
         let limit = args["limit"].as_u64().unwrap_or(200) as usize;
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -1074,9 +1092,7 @@ impl McpServer {
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -1149,9 +1165,7 @@ impl McpServer {
         })? as usize;
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
@@ -1390,9 +1404,7 @@ impl McpServer {
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let index_arc = self
-            .cache
-            .get_or_load(repo, false)
+        let index_arc = self.load_repo(repo)
             .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
