@@ -26,6 +26,9 @@ ahash = { version = "0.8", features = ["serde"] }
 dashmap = { workspace = true }
 bincode = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Tree-sitter for symbol extraction
 tree-sitter = "0.23"
 tree-sitter-rust = "0.23"

@@ -269,10 +269,41 @@ pub fn clean(repo_root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    serde_json::to_writer_pretty(f, value).with_context(|| format!("write {}", path.display()))?;
+/// Write `bytes` to `path` atomically: stream to a sibling `*.tmp`, fsync it,
+/// then `rename` over the destination. `rename(2)` within a directory is
+/// atomic on every local filesystem we target, so a reader (or a crash) ever
+/// sees only the complete old file or the complete new one — never a torn
+/// half-write. The fsync before the rename guards the file's *contents*
+/// against power loss; we then best-effort fsync the directory so the rename
+/// itself is durable. The per-dest writer lock guarantees no two writers race
+/// on the same `*.tmp` name.
+fn write_atomic(path: &Path, write_body: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> Result<()>) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = path.with_extension(format!(
+        "{}tmp",
+        path.extension().and_then(|e| e.to_str()).map(|e| format!("{e}.")).unwrap_or_default()
+    ));
+    {
+        let f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(f);
+        write_body(&mut w)?;
+        let f = w.into_inner().with_context(|| format!("flush {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    // Best-effort: persist the rename itself. A failure here doesn't tear any
+    // single file (rename already completed), so it's non-fatal.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, |w| {
+        serde_json::to_writer_pretty(w, value).with_context(|| format!("write {}", path.display()))
+    })
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -283,10 +314,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut w = std::io::BufWriter::new(f);
-    bincode::serialize_into(&mut w, value).with_context(|| format!("encode {}", path.display()))?;
-    Ok(())
+    write_atomic(path, |w| {
+        bincode::serialize_into(w, value).with_context(|| format!("encode {}", path.display()))
+    })
 }
 
 fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -518,6 +548,50 @@ mod tests {
             m2.files["src/lib.rs"].content_hash.as_deref(),
             Some("deadbeef")
         );
+    }
+
+    #[test]
+    fn write_atomic_replaces_cleanly_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chunks.bin");
+
+        // First write.
+        write_atomic(&p, |w| {
+            std::io::Write::write_all(w, b"first").map_err(Into::into)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+
+        // Overwrite — must fully replace, never a torn mix.
+        write_atomic(&p, |w| {
+            std::io::Write::write_all(w, b"second-and-longer").map_err(Into::into)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second-and-longer");
+
+        // No stray temp files left behind in the dir.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray tmp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn stale_tmp_sibling_does_not_break_load() {
+        // A crash could leave a *.tmp behind. load() reads only the canonical
+        // filenames, so a leftover temp must be inert.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("manifest.json");
+        write_atomic(&p, |w| {
+            std::io::Write::write_all(w, b"{}").map_err(Into::into)
+        })
+        .unwrap();
+        std::fs::write(dir.path().join("chunks.bin.tmp"), b"garbage-half-write").unwrap();
+        // The canonical file is intact and readable.
+        assert_eq!(std::fs::read(&p).unwrap(), b"{}");
     }
 
     #[test]

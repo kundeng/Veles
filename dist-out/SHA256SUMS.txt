@@ -1,0 +1,2 @@
+d8d7b4ad1128d93e4406e7c93a6d4760c5159fadb92b38572a9f3d47ac352ef5  veles-0.6.0-dashboard-aarch64-apple-darwin.tar.gz
+09b97da9c1de76b1df1c7af8001e8a5a5fb8cef12444a01edb218734553f2ee2  veles-0.6.0-dashboard-x86_64-unknown-linux-gnu.tar.gz

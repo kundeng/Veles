@@ -100,6 +100,7 @@ pub mod cache;
 pub mod chunker;
 pub mod filter;
 pub mod index;
+pub mod lock;
 pub mod model;
 pub mod persist;
 pub mod ranking;

@@ -3093,6 +3093,7 @@ dependencies = [
  "dashmap",
  "globset",
  "ignore",
+ "libc",
  "model2vec-rs",
  "rayon",
  "regex",
