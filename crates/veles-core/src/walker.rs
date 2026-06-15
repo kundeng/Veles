@@ -260,6 +260,53 @@ pub static FILE_TYPES: &[(&str, FileType)] = &[
             category: FileCategory::Document,
         },
     ),
+    // Prose / plain-text documents. Like all `Document` types these are only
+    // crawled under `--include-text-files`; the default code path skips them.
+    // They line-chunk (no tree-sitter) — the language label is for `lang`
+    // filtering and display only.
+    (
+        ".txt",
+        FileType {
+            language: "text",
+            category: FileCategory::Document,
+        },
+    ),
+    (
+        ".text",
+        FileType {
+            language: "text",
+            category: FileCategory::Document,
+        },
+    ),
+    (
+        ".markdown",
+        FileType {
+            language: "markdown",
+            category: FileCategory::Document,
+        },
+    ),
+    (
+        ".rst",
+        FileType {
+            language: "rst",
+            category: FileCategory::Document,
+        },
+    ),
+    // Line-delimited JSON — chat/agent transcripts, logs, event streams.
+    (
+        ".jsonl",
+        FileType {
+            language: "jsonl",
+            category: FileCategory::Document,
+        },
+    ),
+    (
+        ".ndjson",
+        FileType {
+            language: "jsonl",
+            category: FileCategory::Document,
+        },
+    ),
 ];
 
 /// Default ignored directory names.
@@ -352,8 +399,12 @@ pub fn filter_extensions(
     }
 }
 
-/// Maximum file size to read and index (1 MB).
-const MAX_FILE_BYTES: u64 = 1_000_000;
+/// Maximum file size to read and index (5 MB).
+///
+/// Raised from 1 MB so larger prose/data documents — chat & agent
+/// transcripts (`.jsonl`/`.ndjson`), long Markdown — index in full
+/// rather than being silently skipped.
+const MAX_FILE_BYTES: u64 = 5_000_000;
 
 /// Walk files under `root` matching the given extensions.
 ///
