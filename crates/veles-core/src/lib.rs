@@ -103,6 +103,7 @@ pub mod index;
 pub mod lock;
 pub mod model;
 pub mod persist;
+pub mod pipeline;
 pub mod ranking;
 pub mod scope;
 pub mod symbols;

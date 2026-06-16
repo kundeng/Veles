@@ -190,6 +190,43 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn handle_transform(config: String) -> Result<()> {
+    let cfg_path = veles_core::pipeline::expand_tilde(&config);
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read pipeline config {}", cfg_path.display()))?;
+    let cfg: veles_core::pipeline::PipelineConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("parse pipeline config {}", cfg_path.display()))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mdl = load_model(false)?;
+    let reports = veles_core::pipeline::run_pipeline(&cfg, &mdl, now)?;
+
+    for r in &reports {
+        if let Some(holder) = &r.skipped_locked {
+            println!(
+                "stage {:?}: SKIPPED — another writer owns this dest ({})",
+                r.stage, holder
+            );
+            continue;
+        }
+        println!(
+            "stage {:?}: {} source(s), +{} derived, -{} removed, {} transform failure(s) — index now {} files / {} chunks",
+            r.stage,
+            r.sources_seen,
+            r.derived_written,
+            r.derived_removed,
+            r.transform_failures,
+            r.indexed_files,
+            r.total_chunks,
+        );
+    }
+    Ok(())
+}
+
 pub fn handle_status(path: String) -> Result<()> {
     let path_buf = PathBuf::from(&path);
     if !persist::index_exists(&path_buf) {

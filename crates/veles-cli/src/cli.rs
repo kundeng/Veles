@@ -145,6 +145,18 @@ pub enum Commands {
         multilingual: bool,
     },
 
+    /// Run an ingest pipeline once: for each stage, (re)derive changed
+    /// sources via their external transform commands and (incrementally)
+    /// index the destination. Idempotent and lock-guarded — safe to re-run.
+    ///
+    /// veles stays format-blind: the transform command owns all knowledge of
+    /// the source format and emits indexable text on stdout.
+    Transform {
+        /// Path to a pipeline config (JSON). See `veles.pipeline.json`.
+        #[arg(default_value = "veles.pipeline.json")]
+        config: String,
+    },
+
     /// Show stats about the persisted index at `<path>/.veles/`.
     Status {
         /// Local path of the indexed repo (default: current directory).
