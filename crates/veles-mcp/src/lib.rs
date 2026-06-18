@@ -604,10 +604,18 @@ impl McpServer {
                     .cache
                     .get_or_load(&repo_key, self.include_text_files)
                     .await?;
-                if !repo_key.starts_with("http")
-                    && !veles_core::persist::index_exists(Path::new(&repo_key))
-                {
-                    index.read().await.save(Path::new(&repo_key))?;
+                if !repo_key.starts_with("http") {
+                    // Serialize the initial publish through the index write lock
+                    // — the same lock the watcher takes before its update+save —
+                    // so concurrent preparers (the background preload and an
+                    // early search) and the watcher never run overlapping saves,
+                    // which would race on `.veles/CURRENT.tmp` and on generation
+                    // cleanup. Re-check existence *under* the lock so exactly one
+                    // writer publishes the first generation; the rest skip it.
+                    let guard = index.write().await;
+                    if !veles_core::persist::index_exists(Path::new(&repo_key)) {
+                        guard.save(Path::new(&repo_key))?;
+                    }
                 }
                 Ok(index)
             }
@@ -1714,5 +1722,40 @@ mod protocol_tests {
                 .any(|chunk| chunk.file_path == "notes.md")
         );
         assert!(veles_core::persist::current_generation(dir.path()).is_some());
+    }
+
+    /// Regression: the background preload and an early search both take the
+    /// Writer path and call `save()`. Before serializing the initial publish
+    /// through the index write lock (with an existence re-check under the
+    /// lock), two saves raced on `.veles/CURRENT.tmp` and on generation
+    /// cleanup, leaving two generations and a failed rename. Concurrent
+    /// preparation must publish exactly one generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_preparation_publishes_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let repo = dir.path().to_str().unwrap().to_string();
+        let model = veles_core::model::load_model(None).expect("test model");
+        let server = Arc::new(McpServer::new(model).with_default_repo(repo.clone()));
+
+        // Two writers preparing the same fresh repo at once (preload + search).
+        let (s1, s2) = (server.clone(), server.clone());
+        let (r1, r2) = (repo.clone(), repo.clone());
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { s1.load_repo(&r1).await.map(|_| ()) }),
+            tokio::spawn(async move { s2.load_repo(&r2).await.map(|_| ()) }),
+        );
+        a.unwrap().expect("prepare 1");
+        b.unwrap().expect("prepare 2");
+
+        let generations = std::fs::read_dir(dir.path().join(".veles").join("generations"))
+            .unwrap()
+            .count();
+        assert_eq!(
+            generations, 1,
+            "concurrent preparation must publish exactly one generation, found {generations}"
+        );
+        assert!(veles_core::persist::index_exists(dir.path()));
     }
 }
