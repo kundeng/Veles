@@ -1,6 +1,7 @@
 # Veles documentation
 
 - [Product and architecture specification](design/automatic-workspace-indexing.md) — canonical behavior for automatic MCP workspace indexing, repository coordination, and advanced transformed sources.
+- [Coordination and pipeline model](design/coordination-and-pipeline-model.md) — design rationale and roadmap for the writer/reader ownership boundary; marks implemented vs proposed.
 - [README](../README.md) — product overview and common installation and usage.
 - [USAGE](../USAGE.md) — CLI and MCP reference.
 - [MCP integration guide](../crates/veles-mcp/README.md) — coding-agent setup and MCP tool behavior.
