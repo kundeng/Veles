@@ -8,6 +8,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -15,8 +16,9 @@ use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, Json},
-    routing::get,
+    routing::{get, post},
 };
+use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -64,6 +66,7 @@ pub fn serve(
             .route("/", get(index))
             .route("/api/status", get(status))
             .route("/api/events", get(events_sse))
+            .route("/api/related", post(add_related))
             .with_state(state);
 
         if let Err(e) = listener.set_nonblocking(true) {
@@ -133,6 +136,111 @@ async fn events_sse(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// Request body for `POST /api/related`: a repo path to add to the read-set.
+#[derive(Deserialize)]
+struct AddRepoRequest {
+    path: String,
+}
+
+/// Add a repo to this workspace's `[related]` read-set in
+/// `<workspace>/.veles/config.toml`. Persists only — the read-set is loaded at
+/// server start (`VelesServer::refresh_related`), so the caller is told the
+/// change applies the next time the MCP server starts.
+async fn add_related(
+    State(st): State<DashState>,
+    Json(req): Json<AddRepoRequest>,
+) -> Json<serde_json::Value> {
+    match add_related_repo(&st.workspace, req.path.trim()) {
+        Ok(msg) => {
+            let _ = st.events.send(format!("added related repo: {}", req.path.trim()));
+            Json(serde_json::json!({ "ok": true, "message": msg }))
+        }
+        Err(e) => Json(serde_json::json!({ "ok": false, "message": e })),
+    }
+}
+
+/// Resolve `repo_path` (absolute, or relative to `workspace`), validate it is a
+/// directory distinct from the workspace, and append its canonical path to the
+/// `[related].repos` array of `<workspace>/.veles/config.toml`, preserving the
+/// file's existing comments and layout. Idempotent: an already-listed repo is a
+/// no-op success. Returns a human-readable status message.
+fn add_related_repo(workspace: &str, repo_path: &str) -> Result<String, String> {
+    if repo_path.is_empty() {
+        return Err("enter a repository path".into());
+    }
+    let ws = Path::new(workspace);
+    let candidate = if Path::new(repo_path).is_absolute() {
+        PathBuf::from(repo_path)
+    } else {
+        ws.join(repo_path)
+    };
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|e| format!("cannot resolve {repo_path:?}: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    let canonical_str = canonical.to_string_lossy().into_owned();
+    if canonical_str == workspace {
+        return Err("that is the current workspace, not a related repo".into());
+    }
+
+    let cfg_dir = veles_core::persist::index_dir_for(ws);
+    std::fs::create_dir_all(&cfg_dir)
+        .map_err(|e| format!("cannot create {}: {e}", cfg_dir.display()))?;
+    let cfg_path = cfg_dir.join("config.toml");
+    let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("{} is malformed: {e}", cfg_path.display()))?;
+
+    let related = doc
+        .entry("related")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let related_tbl = related
+        .as_table_mut()
+        .ok_or("`related` in config.toml is not a table")?;
+    let repos_item = related_tbl.entry("repos").or_insert(toml_edit::Item::Value(
+        toml_edit::Value::Array(toml_edit::Array::new()),
+    ));
+    let arr = repos_item
+        .as_array_mut()
+        .ok_or("`related.repos` in config.toml is not an array")?;
+
+    // Dedupe by canonical path, resolving existing entries the same way the
+    // loader (`load_related_repos`) does so relative/absolute forms collapse.
+    for v in arr.iter() {
+        if let Some(s) = v.as_str() {
+            let existing = if Path::new(s).is_absolute() {
+                PathBuf::from(s)
+            } else {
+                ws.join(s)
+            };
+            if std::fs::canonicalize(&existing)
+                .ok()
+                .map(|c| c.to_string_lossy().into_owned())
+                .as_deref()
+                == Some(canonical_str.as_str())
+            {
+                return Ok(format!("{canonical_str} is already in the read-set"));
+            }
+        }
+    }
+    arr.push(canonical_str.as_str());
+
+    std::fs::write(&cfg_path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", cfg_path.display()))?;
+
+    let indexed = veles_core::persist::current_generation(&canonical).is_some();
+    let restart_note = "applies the next time the MCP server starts";
+    if indexed {
+        Ok(format!("added {canonical_str} — {restart_note}"))
+    } else {
+        Ok(format!(
+            "added {canonical_str}, but it has no veles index yet — run `veles index` there, then it {restart_note}"
+        ))
+    }
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
@@ -155,6 +263,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
   #feed { background: #8881; border-radius: 8px; padding: .5rem 1rem; height: 16rem; overflow-y: auto; }
   #feed div { white-space: pre-wrap; }
   .muted { color: #888; }
+  #addform { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
+  #addpath { flex: 1; min-width: 18rem; font: inherit; padding: .4rem .6rem; border: 1px solid #8884; border-radius: 6px; background: transparent; color: inherit; }
+  #addbtn { font: inherit; padding: .4rem .9rem; border: 1px solid #8884; border-radius: 6px; background: #8881; color: inherit; cursor: pointer; }
+  #addbtn:disabled { opacity: .5; cursor: default; }
+  #addmsg { font-size: .8rem; margin: .25rem 0; min-height: 1.2em; }
+  #addmsg.ok { color: #2a7; } #addmsg.err { color: #a55; }
 </style>
 </head>
 <body>
@@ -162,6 +276,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="muted">Workspace: <span id="workspace"></span> · automatic updates: <span id="watch"></span></div>
   <h2>Indexed repositories</h2>
   <div id="repos"></div>
+  <h2>Add a related repository</h2>
+  <div class="muted">Adds a repo to this workspace's <code>[related]</code> read-set so its code joins searches. Persisted to <code>.veles/config.toml</code>; applies next time the MCP server starts.</div>
+  <form id="addform">
+    <input id="addpath" type="text" placeholder="/absolute/path/to/repo  (or path relative to workspace)" autocomplete="off" spellcheck="false">
+    <button id="addbtn" type="submit">Add</button>
+  </form>
+  <div id="addmsg"></div>
   <h2>Live activity</h2>
   <div id="feed"></div>
 <script>
@@ -199,6 +320,32 @@ function line(t) {
   f.appendChild(d); f.scrollTop = f.scrollHeight;
   if (f.childElementCount > 200) f.removeChild(f.firstChild);
 }
+const form = document.getElementById('addform');
+const pathInput = document.getElementById('addpath');
+const addBtn = document.getElementById('addbtn');
+const addMsg = document.getElementById('addmsg');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const path = pathInput.value.trim();
+  if (!path) return;
+  addBtn.disabled = true; addMsg.className = 'muted'; addMsg.textContent = 'adding…';
+  try {
+    const res = await fetch('/api/related', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const r = await res.json();
+    addMsg.className = r.ok ? 'ok' : 'err';
+    addMsg.textContent = r.message;
+    if (r.ok) pathInput.value = '';
+  } catch (err) {
+    addMsg.className = 'err'; addMsg.textContent = 'request failed: ' + err;
+  } finally {
+    addBtn.disabled = false;
+    refresh();
+  }
+});
 const es = new EventSource('/api/events');
 es.onmessage = (e) => { line(e.data); refresh(); };
 refresh(); setInterval(refresh, 5000);
@@ -217,5 +364,89 @@ mod tests {
         let occupied_port = occupied.local_addr().unwrap().port();
         let (_listener, addr) = bind(occupied_port).unwrap();
         assert_ne!(addr.port(), occupied_port);
+    }
+
+    fn read_related(ws: &Path) -> Vec<String> {
+        let cfg = std::fs::read_to_string(
+            veles_core::persist::index_dir_for(ws).join("config.toml"),
+        )
+        .unwrap();
+        let doc = cfg.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["related"]["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn add_related_persists_canonical_path() {
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_canon = std::fs::canonicalize(other.path()).unwrap();
+
+        let msg = add_related_repo(
+            ws.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(msg.contains(other_canon.to_str().unwrap()), "msg: {msg}");
+        assert_eq!(
+            read_related(ws.path()),
+            vec![other_canon.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn add_related_is_idempotent() {
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let p = other.path().to_str().unwrap();
+        add_related_repo(ws.path().to_str().unwrap(), p).unwrap();
+        let again = add_related_repo(ws.path().to_str().unwrap(), p).unwrap();
+        assert!(again.contains("already"), "msg: {again}");
+        assert_eq!(read_related(ws.path()).len(), 1);
+    }
+
+    #[test]
+    fn add_related_preserves_existing_config() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg_dir = veles_core::persist::index_dir_for(ws.path());
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "# my read-set\n[related]\nrepos = []\n",
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        add_related_repo(
+            ws.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(cfg_dir.join("config.toml")).unwrap();
+        assert!(text.contains("# my read-set"), "comment lost: {text}");
+    }
+
+    #[test]
+    fn add_related_rejects_workspace_itself() {
+        let ws = tempfile::tempdir().unwrap();
+        let wp = ws.path().to_str().unwrap();
+        // canonicalize so the comparison against the stored workspace matches.
+        let canon = std::fs::canonicalize(ws.path()).unwrap();
+        let err = add_related_repo(canon.to_str().unwrap(), wp).unwrap_err();
+        assert!(err.contains("current workspace"), "err: {err}");
+    }
+
+    #[test]
+    fn add_related_rejects_nonexistent_path() {
+        let ws = tempfile::tempdir().unwrap();
+        let err = add_related_repo(
+            ws.path().to_str().unwrap(),
+            "/no/such/path/veles-test",
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot resolve"), "err: {err}");
     }
 }

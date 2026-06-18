@@ -25,10 +25,14 @@ notify-debouncer-full = "0.7.0"
 # Optional per-repo web dashboard (off by default to keep the binary lean).
 axum = { version = "0.7", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+# Format-preserving edits to the hand-edited `.veles/config.toml` when the
+# dashboard adds a repo to the `[related]` read-set. Only pulled in with the
+# `dashboard` feature; keeps the comments/layout the user wrote.
+toml_edit = { version = "0.22", optional = true }
 
 [features]
 # Build a per-repo web dashboard served from `serve-mcp --dashboard`.
-dashboard = ["dep:axum", "dep:tokio-stream", "tokio/net", "tokio/rt-multi-thread"]
+dashboard = ["dep:axum", "dep:tokio-stream", "dep:toml_edit", "tokio/net", "tokio/rt-multi-thread"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

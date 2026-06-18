@@ -3194,6 +3194,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toml_edit",
  "tracing",
  "veles-core",
 ]
