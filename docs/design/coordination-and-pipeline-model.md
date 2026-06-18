@@ -103,9 +103,38 @@ Today the coordinator lives inside `veles-mcp` (`src/watch.rs`):
   configured transformed corpora. There is no long-running pipeline daemon yet.
 
 So the writer is "whichever MCP process won the lock." That is correct, but it
-puts the write lifecycle inside the reader binary.
+puts the write lifecycle inside the reader binary — and that is the wrong place.
 
-## Target architecture **[proposed]**
+## Decision (2026-06-18): the coordinator is an out-of-process daemon
+
+The in-process model above is **interim**. The decided target is a separate,
+out-of-process coordinator per destination; the MCP server is a pure reader
+that *ensures* one exists. Three concrete problems with hosting the write
+lifecycle inside the MCP process drove the decision:
+
+1. **Cross-repository search exposes the conflation.** An MCP launched in
+   repo A may be asked to search repo B. In the in-process model it then
+   becomes B's writer *inside the A session* — it starts watching and indexing
+   B just because someone searched it. Indexing repo B is not the job of "the
+   MCP server for A." The correct response to "B has no writer" is *ensure a
+   coordinator daemon for B is running*, then read B's committed index — not to
+   turn this reader into B's indexer.
+
+2. **Lifecycle coupling.** If the writer lives inside an MCP process, B's index
+   freshness is hostage to the A agent's session: when that MCP exits, B's
+   writer dies with it even though other agents may still be reading B. A
+   daemon's lifecycle is tied to the *repository's* need, not one client's.
+
+3. **Dashboard ownership and ports** (see below): "which process serves the
+   dashboard" only has a clean answer when there is exactly one coordinator per
+   repository. With N MCP processes there is no such answer; with one daemon
+   per repo there is.
+
+The interim in-process coordinator stays until the daemon lands, because it is
+correct for the common single-repo single-agent case and is fully verified. New
+work targets the daemon model below; it does not extend the in-process writer.
+
+## Target architecture **[decided]**
 
 Make the ownership boundary structural rather than incidental. A long-running
 per-repository coordinator (an index-lifecycle *service*) is the sole writer;
@@ -136,31 +165,68 @@ status/events; release the lock on exit. Ordinary code repositories fit the
 same model as transformed corpora — the code repo is just an input with an
 identity transform.
 
-### Startup UX, in order of priority
+### Startup: MCP self-spawns a detached coordinator **[decided]**
 
-1. **Explicit service [proposed]** — `veles index-service <path>` (avoid
-   exposing the internal word "pipeline" in normal docs), suitable for
-   launchd/systemd.
-2. **Managed startup [proposed]** — `serve-mcp <path> --ensure-service` starts
-   a *detached* coordinator only if no live writer holds the lock. MCP still
-   never becomes the writer. Simultaneous starts race safely on the lock.
+The default requires zero user setup. On attaching to a repo, the MCP process
+runs `ensure_coordinator(repo)`: if no live process holds `repo/.veles/writer.lock`,
+it spawns a **detached** `veles` coordinator subprocess for that repo, then
+proceeds as a pure reader. Simultaneous starts race safely on the lock — the
+loser exits, having done no harm. The MCP never becomes the writer itself.
 
-### Discovery via a runtime file **[proposed]**
+A supervisor-managed mode stays available for persistent/large deployments
+(`veles index-service <path>` under launchd/systemd) — same daemon, externally
+managed lifecycle. It is opt-in; the self-spawn default covers the common case.
 
-The lock decides ownership; a `<repo>/.veles/runtime.json` is informational
-only (never authoritative) and powers `status`/dashboard discovery:
+### Repository scope: the read-set **[decided]**
+
+An MCP serves a **read-set** of repositories. By default the read-set is exactly
+its own workspace — **MCP for repo A reads only A.** A tool call naming a repo
+outside the read-set is out of scope; it does **not** silently make this process
+coordinate that repo. (This is what retires the interim "search `repo=B` turns
+A's MCP into B's indexer" behavior.)
+
+Cross-repository search is explicit and durable. "A and B are related, search
+both" is a persistent fact stored in the workspace, not a per-session toggle:
+
+```toml
+# A/.veles/config.toml
+[related]
+repos = ["../repoB"]
+```
+
+The dashboard edits this config. Adding B: persist it → `ensure_coordinator(B)`
+(spawn B's daemon if unheld) → drop a reader lease in B (below) → include B in
+search scope. On next startup A re-attaches its related repos automatically.
+
+### Discovery via a runtime file **[decided]**
+
+The lock decides ownership; `<repo>/.veles/runtime.json` is informational only
+(never authoritative) and powers `status` and dashboard discovery — "open the
+dashboard for repo X" resolves through X's `runtime.json`, since there is no
+fixed port:
 
 ```json
 { "pid": 12345, "started_at": "...", "dashboard_url": "http://127.0.0.1:49321",
   "generation": 42, "state": "watching" }
 ```
 
-### Process lifecycle **[proposed]**
+### Process lifecycle: reader leases + idle-exit **[decided]**
 
-The coordinator need not live forever: start on first search, stay alive while
-MCP clients are active plus a short idle grace, then exit and restart on the
-next request. MCP must keep serving the last committed index while a
-replacement starts. Large corpora may opt into persistent operation.
+The coordinator does not live forever; it exits once nothing is reading its
+repo, and restarts on the next access. Liveness is *observed*, not declared
+(the same philosophy as `flock`), so a reader crash needs no cleanup:
+
+- **Reader leases.** When an MCP attaches to repo X it creates a lease file
+  `X/.veles/readers/<uuid>` and refreshes its mtime on a fixed interval
+  (≈15s). A reader attached to several repos holds one lease per repo.
+- **Idle-exit.** X's coordinator counts leases whose mtime is fresh (within
+  ≈2× the interval). When that count is zero for a grace window, the daemon
+  releases `writer.lock` and exits. A dead reader simply stops refreshing; its
+  lease ages out and is swept — no detach handshake.
+- **Restart-safe reads.** While a coordinator is absent or restarting, readers
+  keep serving the last committed generation; the next access re-spawns one.
+- **Persistent opt-in.** Large corpora may run the supervisor-managed daemon,
+  which ignores idle-exit.
 
 ### Component split **[proposed]**
 
@@ -175,13 +241,34 @@ veles-mcp       MCP protocol · read-only generation cache · workspace handling
 The split is an *operational ownership boundary* (who may write), not a tidy
 grouping of features.
 
-### Dashboard placement **[proposed]**
+### Dashboard placement and ports **[decided]**
 
-The dashboard belongs to the coordinator, which owns the meaningful state
-(source roots, generation, watch status, transform queue/failures, writer PID
-and uptime). Each coordinator binds an ephemeral port advertised via
-`runtime.json`. The dashboard remains pure observability — it never affects
-coordination or correctness, today or under this plan.
+The dashboard belongs to the **coordinator**, which owns the meaningful state
+(source roots, generation, watch status, role, transform queue/failures, writer
+PID and uptime). This is the second reason coordination must be out-of-process:
+one coordinator per repository means exactly one dashboard per repository, with
+a clear owner and no contention.
+
+Ports follow from there:
+
+- **No fixed port.** Multiple veles processes cannot share one port, so a fixed
+  port is incoherent as a default — it is at most a *preference* that silently
+  falls back to an OS-chosen free port when busy. Code must never assume a
+  process can bind a specific port, and discovery must never depend on one.
+- **Each coordinator binds its own ephemeral port** and records the resulting
+  URL in `<repo>/.veles/runtime.json` (the discovery file above). "Open the
+  dashboard for repo X" = read X's `runtime.json` and visit its `dashboard_url`
+  — works regardless of how many repos/agents are live.
+- **Auto-open** is a per-coordinator convenience (one tab per repository, when
+  its daemon starts), not per MCP client — so N agents on one repo do not open
+  N tabs.
+
+Interim note: in today's in-process model there is no daemon to own the
+dashboard, so a dashboard (when enabled) is served by the MCP process on an
+ephemeral port and is not reliably discoverable across processes. That
+limitation is a direct consequence of the in-process writer and is resolved by
+the daemon, not by a fixed port. The dashboard remains pure observability — it
+never affects coordination or correctness, in either model.
 
 ## User-visible contract
 
@@ -221,14 +308,23 @@ today; a user-facing long-running service command is **[proposed]**.
 | 6 | Event storms/backpressure: per-source debounce, bounded queue, coalescing, at most one active update per destination, a dirty flag for changes during indexing | partial — debounce + single watcher exist; bounded queue + dirty-flag **[proposed]** |
 | 7 | Self-triggering: exclude the index dir and any generated-output subtree from watched source roots; validate topology | partial — `.veles`/heavy dirs excluded relative to root; derived-output topology check **[proposed]** |
 | 8 | Reader freshness via monotonic generation id, not mtime | **[implemented]** |
-| 9 | Process lifecycle: crash releases the OS lock automatically; supervisor/`--ensure-service` restarts; runtime metadata never determines ownership | partial — crash-release + takeover **[implemented]**; supervised idle lifecycle **[proposed]** |
+| 9 | Process lifecycle: crash releases the OS lock automatically; runtime metadata never determines ownership | crash-release + takeover **[implemented]**; idle-exit daemon **[decided]** (below) |
 | 10 | Windows: real file-lock mechanism, or explicitly refuse persistent writer mode on unsupported platforms | **[proposed]** (current fallback allows multiple writers) |
+| 11 | Coordinator is an out-of-process daemon, one per destination; MCP is a pure reader that self-spawns a detached coordinator when no lock holder exists | **[decided]**, not yet built |
+| 12 | Default read-set is the MCP's own workspace; cross-repo search is explicit and persisted in `repo/.veles/config.toml [related]`, edited via the dashboard | **[decided]**, not yet built |
+| 13 | Reader leases (`repo/.veles/readers/<uuid>`, mtime-refreshed) + idle-exit when no fresh lease for a grace window | **[decided]**, not yet built |
+| 14 | Dashboard owned by the coordinator (one per repo), ephemeral port, discovered via `runtime.json`; no fixed port — at most a preference with ephemeral fallback | **[decided]**, not yet built |
 
 ## Summary
 
 The durable principle is the writer/reader ownership boundary enforced by a
-destination file lock and atomic generation publication. It is implemented for
-the MCP-internal case today. The roadmap moves the write lifecycle into an
-explicit, lazily-started, idle-aware coordinator so that `veles serve-mcp`
-remains the entire user-facing contract while the internals gain a clean,
-testable ownership separation.
+destination file lock and atomic generation publication, implemented today for
+the interim MCP-internal case. The **decided** target makes that boundary an
+out-of-process daemon: one coordinator per repository (the sole writer), spawned
+on demand by an MCP that is otherwise a pure reader. An MCP reads only its own
+workspace by default; cross-repo search is explicit and persisted. Coordinators
+idle-exit once no reader lease remains, and each owns its repository's dashboard
+on an ephemeral port discovered via `runtime.json`. The user-facing contract
+stays `veles serve-mcp`; the internals gain a clean, testable ownership
+separation. None of the daemon model is built yet — it is the agreed design for
+the next implementation phase.
