@@ -147,10 +147,15 @@ async fn main() -> Result<()> {
             include_text_files,
             watch,
             dashboard,
+            no_dashboard,
             dashboard_port,
-            dashboard_open,
-            ..
+            no_dashboard_open,
         }) => {
+            // Dashboard defaults ON in a `--features dashboard` build (served by
+            // each spawned coordinator); `--no-dashboard` opts out. Auto-open is
+            // on when served unless `--no-dashboard-open`.
+            let dashboard = !no_dashboard && (dashboard || cfg!(feature = "dashboard"));
+            let dashboard_open = dashboard && !no_dashboard_open;
             handlers::handle_serve_mcp(
                 path,
                 include_text_files,
@@ -166,9 +171,12 @@ async fn main() -> Result<()> {
             path,
             include_text_files,
             dashboard,
+            no_dashboard,
             dashboard_port,
-            dashboard_open,
+            no_dashboard_open,
         }) => {
+            let dashboard = !no_dashboard && (dashboard || cfg!(feature = "dashboard"));
+            let dashboard_open = dashboard && !no_dashboard_open;
             handlers::handle_coordinator(
                 path,
                 include_text_files,

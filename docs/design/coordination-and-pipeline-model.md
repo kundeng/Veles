@@ -310,10 +310,10 @@ today; a user-facing long-running service command is **[proposed]**.
 | 8 | Reader freshness via monotonic generation id, not mtime | **[implemented]** |
 | 9 | Process lifecycle: crash releases the OS lock automatically; runtime metadata never determines ownership | crash-release + takeover **[implemented]**; idle-exit daemon **[decided]** (below) |
 | 10 | Windows: real file-lock mechanism, or explicitly refuse persistent writer mode on unsupported platforms | **[proposed]** (current fallback allows multiple writers) |
-| 11 | Coordinator is an out-of-process daemon, one per destination; MCP is a pure reader that self-spawns a detached coordinator when no lock holder exists | **[decided]**, not yet built |
-| 12 | Default read-set is the MCP's own workspace; cross-repo search is explicit and persisted in `repo/.veles/config.toml [related]`, edited via the dashboard | **[decided]**, not yet built |
-| 13 | Reader leases (`repo/.veles/readers/<uuid>`, mtime-refreshed) + idle-exit when no fresh lease for a grace window | **[decided]**, not yet built |
-| 14 | Dashboard owned by the coordinator (one per repo), ephemeral port, discovered via `runtime.json`; no fixed port — at most a preference with ephemeral fallback | **[decided]**, not yet built |
+| 11 | Coordinator is an out-of-process daemon, one per destination; MCP is a pure reader that self-spawns a detached coordinator when no lock holder exists | **[implemented]** (`veles coordinator`; `feat/coordinator-daemon`) |
+| 12 | Default read-set is the MCP's own workspace; cross-repo search is explicit and persisted in `repo/.veles/config.toml [related]` | **[implemented]** (search merges the read-set, repo-qualified) |
+| 13 | Reader leases (`repo/.veles/readers/<id>`, mtime-refreshed) + idle-exit when no fresh lease for a grace window | **[implemented]** |
+| 14 | Dashboard owned by the coordinator (one per repo), ephemeral port, discovered via `runtime.json`; no fixed port — at most a preference with ephemeral fallback | **[implemented]** (on + auto-open by default in a `--features dashboard` build) |
 
 ## Summary
 

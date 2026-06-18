@@ -190,16 +190,23 @@ pub enum Commands {
         /// Deprecated compatibility flag. Workspace updates are automatic.
         #[arg(long)]
         watch: bool,
-        /// Serve a per-repo web dashboard (index health + live activity feed)
-        /// on a localhost port. Requires a build with `--features dashboard`.
+        /// Explicitly request the per-repo dashboard. In a `--features dashboard`
+        /// build the dashboard is already on by default; this only matters for a
+        /// stock build. The dashboard is served by each repo's coordinator.
         #[arg(long)]
         dashboard: bool,
-        /// Dashboard port (0 = OS-chosen free port; the URL is logged).
+        /// Opt out of the (default-on) dashboard for coordinators this server spawns.
+        #[arg(long)]
+        no_dashboard: bool,
+        /// Preferred dashboard port — only a preference. Each coordinator binds
+        /// its OWN port and falls back to a free one if busy; never assume a
+        /// fixed port. 0 = always OS-chosen.
         #[arg(long, default_value_t = 0)]
         dashboard_port: u16,
-        /// Open the dashboard URL in a browser on startup (owner only, once).
+        /// Opt out of auto-opening the dashboard in a browser (on by default
+        /// when the dashboard is served — one tab per repository).
         #[arg(long)]
-        dashboard_open: bool,
+        no_dashboard_open: bool,
     },
 
     /// Internal: run the per-repository coordinator daemon — the sole writer
@@ -213,16 +220,20 @@ pub enum Commands {
         /// Also index non-code text files.
         #[arg(long)]
         include_text_files: bool,
-        /// Serve this repo's web dashboard (requires a `--features dashboard` build).
+        /// Explicitly request the dashboard (on by default in a `--features
+        /// dashboard` build).
         #[arg(long)]
         dashboard: bool,
+        /// Opt out of the (default-on) dashboard.
+        #[arg(long)]
+        no_dashboard: bool,
         /// Preferred dashboard port (0 = OS-chosen). Only a preference; a busy
         /// port falls back to a free one — each coordinator binds its own.
         #[arg(long, default_value_t = 0)]
         dashboard_port: u16,
-        /// Open the dashboard URL in a browser when the daemon starts.
+        /// Opt out of auto-opening the dashboard when the daemon starts.
         #[arg(long)]
-        dashboard_open: bool,
+        no_dashboard_open: bool,
     },
 
     /// List definitions in a single file (functions, structs, classes, ...).

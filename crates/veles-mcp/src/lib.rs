@@ -67,7 +67,7 @@
 //! [MCP 2024-11-05]: https://modelcontextprotocol.io/specification/2024-11-05
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -496,6 +496,11 @@ pub struct McpServer {
     leases: Mutex<HashMap<String, ReaderLease>>,
     /// Stable lease id for this reader process (one filename per repo).
     reader_id: String,
+    /// Additional repositories searched alongside `default_repo` when a tool
+    /// omits `repo`. Loaded from `<default_repo>/.veles/config.toml [related]`.
+    /// Empty by default — an MCP reads only its own workspace unless the user
+    /// explicitly declares related repos.
+    related: Vec<String>,
     /// Live activity feed; retained for `emit` call sites (best-effort no-op
     /// now that the dashboard lives in the coordinator).
     events: tokio::sync::broadcast::Sender<String>,
@@ -516,13 +521,23 @@ impl McpServer {
             dashboard: (false, 0, false),
             leases: Mutex::new(HashMap::new()),
             reader_id: format!("mcp-{}", std::process::id()),
+            related: Vec::new(),
             events,
         }
     }
 
-    /// Set the workspace used by tool calls that omit `repo`.
+    /// Set the workspace used by tool calls that omit `repo`, and load its
+    /// `[related]` read-set from `<repo>/.veles/config.toml`.
     pub fn with_default_repo(mut self, repo: impl Into<String>) -> Self {
         self.default_repo = repo.into();
+        self.related = load_related_repos(&self.default_repo);
+        if !self.related.is_empty() {
+            eprintln!(
+                "veles: read-set includes {} related repo(s): {}",
+                self.related.len(),
+                self.related.join(", ")
+            );
+        }
         self
     }
 
@@ -552,6 +567,19 @@ impl McpServer {
 
     fn repo_arg<'a>(&'a self, args: &'a Value) -> &'a str {
         args["repo"].as_str().unwrap_or(&self.default_repo)
+    }
+
+    /// The set of repositories a `repo`-less tool call should cover: an
+    /// explicit `repo` argument wins (single repo); otherwise the workspace
+    /// plus its configured `[related]` repos.
+    fn read_set(&self, args: &Value) -> Vec<String> {
+        if let Some(r) = args.get("repo").and_then(|v| v.as_str()) {
+            return vec![r.to_string()];
+        }
+        let mut set = Vec::with_capacity(1 + self.related.len());
+        set.push(self.default_repo.clone());
+        set.extend(self.related.iter().cloned());
+        set
     }
 
     /// Load the committed index for `repo` as a **reader**.
@@ -635,15 +663,21 @@ impl McpServer {
         if self.include_text_files {
             cmd.arg("--include-text-files");
         }
+        // Translate our dashboard preference into the coordinator's flag
+        // vocabulary (dashboard + auto-open are on by default in a
+        // `--features dashboard` coordinator, so we only pass the negations
+        // and an explicit port preference).
         let (dash, port, open) = self.dashboard;
         if dash {
             cmd.arg("--dashboard");
             if port != 0 {
                 cmd.arg("--dashboard-port").arg(port.to_string());
             }
-            if open {
-                cmd.arg("--dashboard-open");
+            if !open {
+                cmd.arg("--no-dashboard-open");
             }
+        } else {
+            cmd.arg("--no-dashboard");
         }
         // Detach: own process group, stdin null, logs to a file in .veles.
         cmd.stdin(std::process::Stdio::null());
@@ -844,8 +878,8 @@ impl McpServer {
             message: "Missing 'query' parameter".into(),
         })?;
 
-        let repo = self.repo_arg(&args);
-        self.emit(format!("search: {query:?} in {repo}"));
+        let repos = self.read_set(&args);
+        self.emit(format!("search: {query:?} in {}", repos.join(", ")));
 
         let mode_str = args["mode"].as_str().unwrap_or("hybrid");
         let mode = mode_str.parse::<SearchMode>().unwrap_or(SearchMode::Hybrid);
@@ -857,46 +891,94 @@ impl McpServer {
         let exclude_globs = string_array(&args, "exclude");
         let min_score = args["min_score"].as_f64();
         let format = args["format"].as_str().unwrap_or("default");
+        let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
 
-        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
-        let index = index_arc.read().await;
-
-        let glob_paths =
-            filter::resolve_path_filter(&index, &path_globs, &exclude_globs).map_err(|e| {
-                JsonRpcError {
+        // Single-repo path: unchanged, and keeps tree-sitter scope labels.
+        if repos.len() == 1 {
+            let index_arc = self.load_repo(&repos[0]).await.map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+            let index = index_arc.read().await;
+            let glob_paths = filter::resolve_path_filter(&index, &path_globs, &exclude_globs)
+                .map_err(|e| JsonRpcError {
                     code: -32000,
                     message: e.to_string(),
+                })?;
+            let mut results =
+                index.search(query, top_k, mode, None, lang_slice, glob_paths.as_deref());
+            if let Some(threshold) = min_score {
+                results.retain(|r| r.score >= threshold);
+            }
+            if results.is_empty() {
+                return Ok(json!({"content": [{"type": "text", "text": "No results found."}]}));
+            }
+            let text = match format {
+                "paths" => format_results_paths(&results),
+                "unique_paths" => format_results_unique_paths(&results),
+                _ => {
+                    let header = format!("Search results for: {query:?} (mode={mode_str})");
+                    format_results(&header, &results, Some(index.symbols()))
                 }
-            })?;
-        let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
-        let path_slice: Option<&[String]> = glob_paths.as_deref();
-
-        let mut results = index.search(query, top_k, mode, None, lang_slice, path_slice);
-        if let Some(threshold) = min_score {
-            results.retain(|r| r.score >= threshold);
+            };
+            return Ok(json!({"content": [{"type": "text", "text": text}]}));
         }
 
-        if results.is_empty() {
-            return Ok(json!({
-                "content": [{"type": "text", "text": "No results found."}]
-            }));
+        // Multi-repo read-set: query each repo, qualify hit paths with the repo
+        // name so they stay unambiguous, then merge by score. Scope labels are
+        // omitted (they would need a single index's symbol table).
+        let mut merged: Vec<veles_core::types::SearchResult> = Vec::new();
+        for repo in &repos {
+            let index_arc = match self.load_repo(repo).await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("veles: read-set skipping {repo}: {e}");
+                    continue;
+                }
+            };
+            let index = index_arc.read().await;
+            let glob_paths = match filter::resolve_path_filter(&index, &path_globs, &exclude_globs)
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("veles: read-set skipping {repo}: {e}");
+                    continue;
+                }
+            };
+            let mut results =
+                index.search(query, top_k, mode, None, lang_slice, glob_paths.as_deref());
+            if let Some(threshold) = min_score {
+                results.retain(|r| r.score >= threshold);
+            }
+            let label = repo_display(repo);
+            for r in results.iter_mut() {
+                r.chunk.file_path = format!("{label}/{}", r.chunk.file_path);
+            }
+            merged.extend(results);
         }
+
+        if merged.is_empty() {
+            return Ok(json!({"content": [{"type": "text", "text": "No results found."}]}));
+        }
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        merged.truncate(top_k);
 
         let text = match format {
-            "paths" => format_results_paths(&results),
-            "unique_paths" => format_results_unique_paths(&results),
+            "paths" => format_results_paths(&merged),
+            "unique_paths" => format_results_unique_paths(&merged),
             _ => {
-                let header = format!("Search results for: {query:?} (mode={mode_str})");
-                format_results(&header, &results, Some(index.symbols()))
+                let header = format!(
+                    "Search results for: {query:?} (mode={mode_str}, {} repos)",
+                    repos.len()
+                );
+                format_results(&header, &merged, None)
             }
         };
-
-        Ok(json!({
-            "content": [{"type": "text", "text": text}]
-        }))
+        Ok(json!({"content": [{"type": "text", "text": text}]}))
     }
 
     async fn handle_defs(&self, args: Value) -> Result<Value, JsonRpcError> {
@@ -1610,6 +1692,65 @@ impl McpServer {
     }
 }
 
+/// `[related]` section of `<workspace>/.veles/config.toml`.
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceConfig {
+    #[serde(default)]
+    related: RelatedConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelatedConfig {
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// Load and canonicalize the `[related]` read-set from
+/// `<workspace>/.veles/config.toml`. Relative repo paths resolve against the
+/// workspace. An absent/unreadable/invalid config, or an unresolvable repo, is
+/// skipped (with a warning for malformed input) — never fatal.
+fn load_related_repos(workspace: &str) -> Vec<String> {
+    let ws = Path::new(workspace);
+    let cfg_path = veles_core::persist::index_dir_for(ws).join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&cfg_path) else {
+        return Vec::new();
+    };
+    let cfg: WorkspaceConfig = match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("veles: ignoring {} ({e})", cfg_path.display());
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for r in cfg.related.repos {
+        let p = if Path::new(&r).is_absolute() {
+            PathBuf::from(&r)
+        } else {
+            ws.join(&r)
+        };
+        match std::fs::canonicalize(&p) {
+            Ok(c) => {
+                let key = c.to_string_lossy().into_owned();
+                if key != workspace && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+            Err(e) => eprintln!("veles: related repo {r:?} unresolved ({e})"),
+        }
+    }
+    out
+}
+
+/// Short label for a repo path (its final component), used to qualify hit
+/// paths when searching a multi-repo read-set.
+fn repo_display(repo: &str) -> String {
+    Path::new(repo)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo.to_string())
+}
+
 /// Pull a `Vec<String>` from a JSON arg that's either an array of strings or absent.
 /// A single string value is also accepted and wrapped in a one-element vec, so
 /// callers that send `"lang": "rust"` instead of `"lang": ["rust"]` still work.
@@ -1751,5 +1892,36 @@ mod protocol_tests {
 
         // The reader registered a lease so the coordinator knows it is needed.
         assert_eq!(veles_core::lease::count_fresh(dir.path()), 1);
+    }
+
+    #[test]
+    fn read_set_loads_related_repos_from_config() {
+        let ws = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        // No config -> read-set is just the workspace.
+        assert!(super::load_related_repos(ws.path().to_str().unwrap()).is_empty());
+
+        // Declare the sibling repo as related (absolute path).
+        std::fs::create_dir_all(ws.path().join(".veles")).unwrap();
+        std::fs::write(
+            ws.path().join(".veles").join("config.toml"),
+            format!("[related]\nrepos = [\"{}\"]\n", other.path().display()),
+        )
+        .unwrap();
+
+        let related = super::load_related_repos(ws.path().to_str().unwrap());
+        let expect = std::fs::canonicalize(other.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(related, vec![expect]);
+    }
+
+    #[test]
+    fn repo_display_is_the_final_path_component() {
+        assert_eq!(
+            super::repo_display("/home/me/projects/agent-notes"),
+            "agent-notes"
+        );
     }
 }
