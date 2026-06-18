@@ -202,6 +202,29 @@ pub enum Commands {
         dashboard_open: bool,
     },
 
+    /// Internal: run the per-repository coordinator daemon — the sole writer
+    /// for one repository (holds the writer lock, watches, indexes, publishes,
+    /// serves the dashboard, idle-exits when no reader remains). Normally
+    /// spawned automatically by `serve-mcp`; not part of the everyday UX.
+    #[command(hide = true)]
+    Coordinator {
+        /// Repository to coordinate.
+        path: String,
+        /// Also index non-code text files.
+        #[arg(long)]
+        include_text_files: bool,
+        /// Serve this repo's web dashboard (requires a `--features dashboard` build).
+        #[arg(long)]
+        dashboard: bool,
+        /// Preferred dashboard port (0 = OS-chosen). Only a preference; a busy
+        /// port falls back to a free one — each coordinator binds its own.
+        #[arg(long, default_value_t = 0)]
+        dashboard_port: u16,
+        /// Open the dashboard URL in a browser when the daemon starts.
+        #[arg(long)]
+        dashboard_open: bool,
+    },
+
     /// List definitions in a single file (functions, structs, classes, ...).
     ///
     /// Tree-sitter parses the file directly — no index required.

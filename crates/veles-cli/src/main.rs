@@ -162,6 +162,23 @@ async fn main() -> Result<()> {
             .await
         }
 
+        Some(Commands::Coordinator {
+            path,
+            include_text_files,
+            dashboard,
+            dashboard_port,
+            dashboard_open,
+        }) => {
+            handlers::handle_coordinator(
+                path,
+                include_text_files,
+                dashboard,
+                dashboard_port,
+                dashboard_open,
+            )
+            .await
+        }
+
         None => handlers::handle_default().await,
     }
 }

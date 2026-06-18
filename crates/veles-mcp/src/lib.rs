@@ -66,8 +66,9 @@
 //! [Veles]: https://github.com/julymetodiev/Veles
 //! [MCP 2024-11-05]: https://modelcontextprotocol.io/specification/2024-11-05
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -75,9 +76,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use veles_core::filter;
+use veles_core::lease::{self, ReaderLease};
+use veles_core::lock;
 use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
 
+pub mod coordinator;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod watch;
@@ -455,7 +459,7 @@ fn tools() -> Vec<Tool> {
 /// when `--dashboard-open` is set. Spawns the platform opener and returns
 /// immediately; any failure is logged, never fatal.
 #[cfg(feature = "dashboard")]
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);
@@ -483,11 +487,17 @@ pub struct McpServer {
     /// the active project before the first search.
     default_repo: String,
     include_text_files: bool,
-    /// Hidden per-repository coordinator. One MCP process retains each
-    /// repository writer lock; peers remain readers.
-    watch: Option<Arc<watch::WatchManager>>,
-    /// Live activity feed (searches, auto-updates). Consumed by the
-    /// dashboard's SSE endpoint; a no-op broadcast when nothing subscribes.
+    /// Dashboard preferences forwarded to coordinators this MCP spawns
+    /// (enabled, preferred port, auto-open). The dashboard is owned by the
+    /// coordinator daemon, never by this reader process.
+    dashboard: (bool, u16, bool),
+    /// Reader leases this process holds, one per repo it reads. Kept alive so
+    /// the owning coordinator knows a reader is present; dropped on shutdown.
+    leases: Mutex<HashMap<String, ReaderLease>>,
+    /// Stable lease id for this reader process (one filename per repo).
+    reader_id: String,
+    /// Live activity feed; retained for `emit` call sites (best-effort no-op
+    /// now that the dashboard lives in the coordinator).
     events: tokio::sync::broadcast::Sender<String>,
 }
 
@@ -495,13 +505,6 @@ impl McpServer {
     pub fn new(model: model2vec_rs::model::StaticModel) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(256);
         let cache = Arc::new(veles_core::cache::IndexCache::new(model));
-        let watch = match watch::WatchManager::new(cache.clone(), events.clone()) {
-            Ok(watch) => Some(watch),
-            Err(e) => {
-                eprintln!("veles: automatic workspace updates unavailable: {e}");
-                None
-            }
-        };
         Self {
             cache,
             server_info: json!({
@@ -510,7 +513,9 @@ impl McpServer {
             }),
             default_repo: ".".to_string(),
             include_text_files: false,
-            watch,
+            dashboard: (false, 0, false),
+            leases: Mutex::new(HashMap::new()),
+            reader_id: format!("mcp-{}", std::process::id()),
             events,
         }
     }
@@ -532,36 +537,11 @@ impl McpServer {
         self
     }
 
-    /// Enable the optional per-repo web dashboard (`serve-mcp --dashboard`).
-    ///
-    /// Dashboard transport is observability only and never participates in
-    /// repository coordination.
-    pub fn with_dashboard(self, enabled: bool, port: u16, open: bool) -> Self {
-        let _ = (port, open); // used only in the `dashboard` feature build
-        if enabled {
-            #[cfg(feature = "dashboard")]
-            match dashboard::bind(port) {
-                Ok((listener, addr)) => {
-                    eprintln!("veles dashboard: http://{addr}");
-                    dashboard::serve(
-                        listener,
-                        self.cache.clone(),
-                        self.watch.clone(),
-                        self.events.clone(),
-                        self.default_repo.clone(),
-                    );
-                    if open {
-                        open_browser(&format!("http://{addr}"));
-                    }
-                }
-                Err(e) => eprintln!("veles dashboard: UI disabled: {e}"),
-            }
-            #[cfg(not(feature = "dashboard"))]
-            eprintln!(
-                "veles dashboard: this binary was built without the `dashboard` feature; \
-                 rebuild with `--features dashboard` to enable the web UI."
-            );
-        }
+    /// Record dashboard preferences to forward to coordinators this MCP
+    /// spawns. The dashboard is served by the coordinator daemon (one per
+    /// repo), not by this reader process — so we only remember the choice.
+    pub fn with_dashboard(mut self, enabled: bool, port: u16, open: bool) -> Self {
+        self.dashboard = (enabled, port, open);
         self
     }
 
@@ -574,11 +554,13 @@ impl McpServer {
         args["repo"].as_str().unwrap_or(&self.default_repo)
     }
 
-    /// Load (or build) the index for `repo`.
+    /// Load the committed index for `repo` as a **reader**.
     ///
-    /// Repository coordination is keyed by the canonical destination lock.
-    /// The lock holder builds, persists, and watches; concurrent MCP processes
-    /// load only committed generations and retry lock acquisition on access.
+    /// This process never writes: it ensures a coordinator daemon owns the
+    /// repo (spawning a detached one if no writer lock is held), records a
+    /// reader lease so that daemon knows it is needed, then reads the
+    /// committed generation — reloading when it advances. It never indexes,
+    /// watches, or acquires the writer lock itself.
     async fn load_repo(
         &self,
         repo: &str,
@@ -588,52 +570,115 @@ impl McpServer {
         } else {
             std::fs::canonicalize(repo)?.to_string_lossy().into_owned()
         };
+        // Remote git URLs have no coordinator: clone-and-read in-process.
         if repo_key.starts_with("http://") || repo_key.starts_with("https://") {
             return self
                 .cache
                 .get_or_load(&repo_key, self.include_text_files)
                 .await;
         }
-        let role = match &self.watch {
-            Some(coordinator) => coordinator.ensure(&repo_key)?,
-            None => watch::RepoRole::Writer,
-        };
-        match role {
-            watch::RepoRole::Writer => {
-                let index = self
+
+        self.ensure_reader(&repo_key);
+
+        // Wait briefly for the coordinator to publish a first generation.
+        for _ in 0..100 {
+            if veles_core::persist::index_exists(Path::new(&repo_key)) {
+                self.cache.refresh_if_stale(&repo_key);
+                return self
                     .cache
                     .get_or_load(&repo_key, self.include_text_files)
-                    .await?;
-                if !repo_key.starts_with("http") {
-                    // Serialize the initial publish through the index write lock
-                    // — the same lock the watcher takes before its update+save —
-                    // so concurrent preparers (the background preload and an
-                    // early search) and the watcher never run overlapping saves,
-                    // which would race on `.veles/CURRENT.tmp` and on generation
-                    // cleanup. Re-check existence *under* the lock so exactly one
-                    // writer publishes the first generation; the rest skip it.
-                    let guard = index.write().await;
-                    if !veles_core::persist::index_exists(Path::new(&repo_key)) {
-                        guard.save(Path::new(&repo_key))?;
-                    }
-                }
-                Ok(index)
+                    .await;
             }
-            watch::RepoRole::Reader => {
-                for _ in 0..100 {
-                    if veles_core::persist::index_exists(Path::new(&repo_key)) {
-                        self.cache.refresh_if_stale(&repo_key);
-                        return self
-                            .cache
-                            .get_or_load(&repo_key, self.include_text_files)
-                            .await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        anyhow::bail!("Veles is still preparing the index for {repo}; retry the request shortly")
+    }
+
+    /// Ensure this process is a registered reader of `repo_key`: hold a fresh
+    /// lease, and make sure a coordinator daemon is running for it.
+    fn ensure_reader(&self, repo_key: &str) {
+        let repo_path = Path::new(repo_key);
+        {
+            let mut leases = self.leases.lock().unwrap();
+            match leases.get(repo_key) {
+                Some(lease) => {
+                    let _ = lease.refresh();
                 }
-                anyhow::bail!(
-                    "Veles is still preparing the index for {repo}; retry the request shortly"
-                )
+                None => match ReaderLease::acquire(repo_path, &self.reader_id) {
+                    Ok(lease) => {
+                        leases.insert(repo_key.to_string(), lease);
+                    }
+                    Err(e) => eprintln!("veles: could not create reader lease for {repo_key}: {e}"),
+                },
             }
+        }
+        // Spawn a coordinator only if none is currently writing. A racing
+        // double-spawn is harmless — both daemons contend on the writer lock
+        // and the loser stands down.
+        if !lock::is_writer_active(repo_path) {
+            self.spawn_coordinator(repo_key);
+        }
+    }
+
+    /// Spawn a detached `veles coordinator <repo>` subprocess. It outlives this
+    /// MCP process (its own process group) and logs to `<repo>/.veles/coordinator.log`.
+    fn spawn_coordinator(&self, repo_key: &str) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("veles: cannot locate veles binary to spawn coordinator: {e}");
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("coordinator").arg(repo_key);
+        if self.include_text_files {
+            cmd.arg("--include-text-files");
+        }
+        let (dash, port, open) = self.dashboard;
+        if dash {
+            cmd.arg("--dashboard");
+            if port != 0 {
+                cmd.arg("--dashboard-port").arg(port.to_string());
+            }
+            if open {
+                cmd.arg("--dashboard-open");
+            }
+        }
+        // Detach: own process group, stdin null, logs to a file in .veles.
+        cmd.stdin(std::process::Stdio::null());
+        let log = veles_core::persist::index_dir_for(Path::new(repo_key)).join("coordinator.log");
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            Ok(f) => match f.try_clone() {
+                Ok(err) => {
+                    cmd.stdout(std::process::Stdio::from(f));
+                    cmd.stderr(std::process::Stdio::from(err));
+                }
+                Err(_) => {
+                    cmd.stdout(std::process::Stdio::from(f));
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            },
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        match cmd.spawn() {
+            Ok(_) => eprintln!("veles: spawned coordinator for {repo_key}"),
+            Err(e) => eprintln!("veles: failed to spawn coordinator for {repo_key}: {e}"),
         }
     }
 
@@ -655,6 +700,20 @@ impl McpServer {
                 );
             } else {
                 preload.emit(format!("workspace ready: {}", preload.default_repo));
+            }
+        });
+
+        // Keep our reader leases fresh so the repositories' coordinators know
+        // we are still here and don't idle-exit out from under us.
+        let keeper = server.clone();
+        tokio::spawn(async move {
+            let interval = lease::refresh_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                let leases = keeper.leases.lock().unwrap();
+                for lease in leases.values() {
+                    let _ = lease.refresh();
+                }
             }
         });
         let stdin = tokio::io::stdin();
@@ -1095,67 +1154,24 @@ impl McpServer {
                 message: format!("Path is not a directory: {repo}"),
             });
         }
-        let path_buf = path.to_path_buf();
-        if let Some(coordinator) = &self.watch
-            && coordinator.role(repo).map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })? == watch::RepoRole::Reader
-        {
-            return Ok(json!({
-                "content": [{"type": "text", "text": "This workspace is updated automatically by another Veles process. The current committed index will be reloaded automatically."}]
-            }));
-        }
-
+        // Reader model: this process never writes. The repository's coordinator
+        // daemon watches and republishes automatically; `update` just ensures a
+        // coordinator exists and reloads the latest committed generation.
         let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
             code: -32000,
             message: e.to_string(),
         })?;
-        let mut index = index_arc.write().await;
-
-        let started = std::time::Instant::now();
-        let report = index
-            .update_from_path(&path_buf)
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
-        let secs = started.elapsed().as_secs_f64();
-
-        let text = if report.is_noop() {
-            format!(
-                "Index is up to date in {secs:.2}s ({} chunks, no file changes detected).",
-                report.total_chunks
-            )
-        } else {
-            // Persist only when something actually changed (chunk-level edits
-            // or a manifest-only mtime refresh).
-            index.save(&path_buf).map_err(|e| JsonRpcError {
-                code: -32000,
-                message: format!("update applied in memory but save failed: {e}"),
-            })?;
-            if report.added_files + report.modified_files + report.removed_files == 0 {
-                format!(
-                    "Refreshed manifest in {secs:.2}s — {} file(s) had stale mtime but unchanged content (kept {} chunks). Persisted to {}/.veles.",
-                    report.mtime_refreshed_files, report.total_chunks, repo,
-                )
-            } else {
-                format!(
-                    "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed, ⟳{} mtime-only (kept {} chunks, embedded {} new, total {}). Persisted to {}/.veles.",
-                    report.added_files,
-                    report.modified_files,
-                    report.removed_files,
-                    report.mtime_refreshed_files,
-                    report.kept_chunks,
-                    report.new_chunks,
-                    report.total_chunks,
-                    repo,
-                )
-            }
-        };
-
+        let chunks = index_arc.read().await.stats().total_chunks;
+        let generation = veles_core::persist::current_generation(path)
+            .map(|g| g.to_string())
+            .unwrap_or_else(|| "none".into());
         Ok(json!({
-            "content": [{"type": "text", "text": text}]
+            "content": [{"type": "text", "text": format!(
+                "This workspace is indexed automatically by its Veles coordinator; \
+                 manual update is unnecessary. Serving committed generation {generation} \
+                 ({chunks} chunks). Edits are picked up within ~1.5s and reloaded on the \
+                 next request."
+            )}]
         }))
     }
 
@@ -1701,61 +1717,39 @@ mod protocol_tests {
         assert!(response.is_none());
     }
 
+    /// Reader model: the MCP serves an already-committed generation and
+    /// registers a reader lease, without writing the index itself. (The
+    /// coordinator daemon is exercised end-to-end in the integration tests;
+    /// here we pre-publish a generation to stand in for it.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn include_text_files_reaches_automatic_workspace_build() {
+    async fn reader_serves_committed_index_and_holds_a_lease() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.md"), "# searchable workspace note\n").unwrap();
+        let key = dir.path().to_string_lossy().into_owned();
+
+        // Stand in for a coordinator: build + publish one generation.
+        let model = veles_core::model::load_model(None).expect("test model");
+        let cache = veles_core::cache::IndexCache::new(model);
+        let built = cache.get_or_load(&key, true).await.expect("build");
+        built.write().await.save(dir.path()).expect("publish");
+        assert!(veles_core::persist::current_generation(dir.path()).is_some());
+
+        // A reader server reads it and never writes.
         let model = veles_core::model::load_model(None).expect("test model");
         let server = McpServer::new(model)
-            .with_default_repo(dir.path().to_string_lossy().into_owned())
+            .with_default_repo(key.clone())
             .with_include_text_files(true);
-
-        let index = server
-            .load_repo(dir.path().to_str().unwrap())
-            .await
-            .expect("prepare workspace");
-        let index = index.read().await;
+        let index = server.load_repo(&key).await.expect("read committed index");
         assert!(
             index
+                .read()
+                .await
                 .chunks()
                 .iter()
                 .any(|chunk| chunk.file_path == "notes.md")
         );
-        assert!(veles_core::persist::current_generation(dir.path()).is_some());
-    }
 
-    /// Regression: the background preload and an early search both take the
-    /// Writer path and call `save()`. Before serializing the initial publish
-    /// through the index write lock (with an existence re-check under the
-    /// lock), two saves raced on `.veles/CURRENT.tmp` and on generation
-    /// cleanup, leaving two generations and a failed rename. Concurrent
-    /// preparation must publish exactly one generation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_preparation_publishes_one_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
-        let repo = dir.path().to_str().unwrap().to_string();
-        let model = veles_core::model::load_model(None).expect("test model");
-        let server = Arc::new(McpServer::new(model).with_default_repo(repo.clone()));
-
-        // Two writers preparing the same fresh repo at once (preload + search).
-        let (s1, s2) = (server.clone(), server.clone());
-        let (r1, r2) = (repo.clone(), repo.clone());
-        let (a, b) = tokio::join!(
-            tokio::spawn(async move { s1.load_repo(&r1).await.map(|_| ()) }),
-            tokio::spawn(async move { s2.load_repo(&r2).await.map(|_| ()) }),
-        );
-        a.unwrap().expect("prepare 1");
-        b.unwrap().expect("prepare 2");
-
-        let generations = std::fs::read_dir(dir.path().join(".veles").join("generations"))
-            .unwrap()
-            .count();
-        assert_eq!(
-            generations, 1,
-            "concurrent preparation must publish exactly one generation, found {generations}"
-        );
-        assert!(veles_core::persist::index_exists(dir.path()));
+        // The reader registered a lease so the coordinator knows it is needed.
+        assert_eq!(veles_core::lease::count_fresh(dir.path()), 1);
     }
 }

@@ -230,10 +230,6 @@ impl WatchManager {
             })
             .collect()
     }
-
-    pub fn role(&self, repo: &str) -> Result<RepoRole> {
-        self.ensure(repo)
-    }
 }
 
 /// True if any component of a repo-relative path is an ignored dir

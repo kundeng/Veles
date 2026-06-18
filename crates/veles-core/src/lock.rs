@@ -153,6 +153,50 @@ fn raw_try_lock_exclusive(_file: &File) -> Result<bool> {
     Ok(true)
 }
 
+/// Non-retaining probe: is a live writer currently holding `dest_root`'s lock?
+///
+/// Unlike [`try_acquire`], this never *keeps* the lock — it momentarily tries
+/// the exclusive lock and, if it succeeds, immediately releases it. A reader
+/// (e.g. an MCP server) uses this to decide whether to spawn a coordinator
+/// without ever becoming the writer itself. Concurrent probers serialize for
+/// sub-millisecond windows; a returned `false` only means "no writer right
+/// now", so callers must tolerate a racing spawn (the writer lock is the real
+/// arbiter — duplicate coordinators self-resolve on it).
+///
+/// On non-unix (no real advisory lock) this conservatively returns `false`.
+#[cfg(unix)]
+pub fn is_writer_active(dest_root: &Path) -> bool {
+    let path = index_dir_for(dest_root).join(LOCK_FILE);
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return false;
+    };
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a valid open descriptor owned by `file`. LOCK_NB never blocks.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // We just acquired it ⇒ nobody held it. Release immediately.
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
+        false
+    } else {
+        // Held by another process (EWOULDBLOCK) ⇒ a writer is active.
+        true
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_writer_active(_dest_root: &Path) -> bool {
+    false
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

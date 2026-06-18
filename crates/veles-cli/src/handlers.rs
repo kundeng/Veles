@@ -552,6 +552,26 @@ pub async fn handle_serve_mcp(
     Ok(())
 }
 
+/// Run the per-repository coordinator daemon (internal; spawned by `serve-mcp`).
+pub async fn handle_coordinator(
+    path: String,
+    include_text_files: bool,
+    dashboard: bool,
+    dashboard_port: u16,
+    dashboard_open: bool,
+) -> Result<()> {
+    let mdl = model::load_model(None)?;
+    veles_mcp::coordinator::run(
+        mdl,
+        path,
+        include_text_files,
+        dashboard,
+        dashboard_port,
+        dashboard_open,
+    )
+    .await
+}
+
 /// Default behaviour when no subcommand is given.
 ///
 /// On an interactive terminal, print `--help` so a user who just ran
