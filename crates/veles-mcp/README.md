@@ -55,8 +55,23 @@ From the CLI (the default if no subcommand is given):
 
 ```sh
 veles serve-mcp
-veles            # equivalent — bare `veles` starts MCP on a piped stdin
 ```
+
+That is the complete normal setup. Veles discovers the coding agent's
+workspace, prepares its index in the background, and keeps it current
+automatically. Multiple agents may start their own MCP processes for the same
+repository; they share one repository-local updater without configuration.
+Different repositories update independently.
+
+An explicit path remains available for clients that do not launch MCP servers
+from the workspace:
+
+```sh
+veles serve-mcp /absolute/path/to/project
+```
+
+Workspace precedence is explicit path, `VELES_WORKSPACE`,
+`CLAUDE_PROJECT_DIR`, then the server process's current directory.
 
 From code:
 
@@ -83,7 +98,45 @@ Add an entry to `claude_desktop_config.json`:
 }
 ```
 
-The same shape works for any other MCP-aware client.
+For coding agents, configure Veles once:
+
+```toml
+# Codex: .codex/config.toml
+[mcp_servers.veles]
+command = "veles"
+args = ["serve-mcp"]
+cwd = "."
+```
+
+```sh
+claude mcp add --scope user veles -- veles serve-mcp
+```
+
+```json
+// VS Code: .vscode/mcp.json
+{
+  "servers": {
+    "veles": {
+      "type": "stdio",
+      "command": "veles",
+      "args": ["serve-mcp", "${workspaceFolder}"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
+```
+
+Gemini CLI uses the same `command` / `args` shape. Set the MCP server working
+directory to the project root when the client supports it.
+
+### Optional observability
+
+`--dashboard` adds a local status page. It does not control indexing or
+coordination:
+
+```sh
+veles serve-mcp --dashboard --dashboard-open
+```
 
 ## See also
 

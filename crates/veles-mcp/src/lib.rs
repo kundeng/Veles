@@ -78,9 +78,9 @@ use veles_core::filter;
 use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
 
-mod watch;
 #[cfg(feature = "dashboard")]
 mod dashboard;
+mod watch;
 
 // ── JSON-RPC Types ────────────────────────────────────────────────────────
 
@@ -478,119 +478,83 @@ fn open_browser(url: &str) {
 pub struct McpServer {
     cache: Arc<veles_core::cache::IndexCache>,
     server_info: Value,
-    /// Present only when `--watch` is enabled; keeps cached indexes fresh
-    /// by running incremental updates on filesystem changes.
+    /// Canonical local workspace used whenever a tool call omits `repo`.
+    /// It is also loaded after MCP initialization so the dashboard identifies
+    /// the active project before the first search.
+    default_repo: String,
+    include_text_files: bool,
+    /// Hidden per-repository coordinator. One MCP process retains each
+    /// repository writer lock; peers remain readers.
     watch: Option<Arc<watch::WatchManager>>,
     /// Live activity feed (searches, auto-updates). Consumed by the
     /// dashboard's SSE endpoint; a no-op broadcast when nothing subscribes.
     events: tokio::sync::broadcast::Sender<String>,
-    /// Singleton election result. `true` = this process owns the dashboard
-    /// port, and therefore owns watching + updating the indexes; `false` =
-    /// another veles instance owns it and we run as a follower (no watcher,
-    /// no dashboard — we reload persisted indexes on read instead). Defaults
-    /// to `true` so non-dashboard builds and the lone-process case behave as
-    /// before. `Arc<Atomic>` because a follower can self-promote to owner
-    /// from a shared-`&self` request path when the previous owner exits.
-    owner: Arc<std::sync::atomic::AtomicBool>,
-    /// Dashboard config remembered for self-promotion (re-binding the port).
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    dashboard_enabled: bool,
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    dashboard_port: u16,
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    dashboard_open: bool,
 }
 
 impl McpServer {
     pub fn new(model: model2vec_rs::model::StaticModel) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(256);
+        let cache = Arc::new(veles_core::cache::IndexCache::new(model));
+        let watch = match watch::WatchManager::new(cache.clone(), events.clone()) {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                eprintln!("veles: automatic workspace updates unavailable: {e}");
+                None
+            }
+        };
         Self {
-            cache: Arc::new(veles_core::cache::IndexCache::new(model)),
+            cache,
             server_info: json!({
                 "name": "veles",
                 "version": env!("CARGO_PKG_VERSION"),
             }),
-            watch: None,
+            default_repo: ".".to_string(),
+            include_text_files: false,
+            watch,
             events,
-            owner: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            dashboard_enabled: false,
-            dashboard_port: 0,
-            dashboard_open: false,
         }
     }
 
-    /// Enable filesystem auto-update. When on, every repo opened in this
-    /// session is watched and its index incrementally refreshed (debounced)
-    /// as files change — so search never serves a stale index. Off by default.
-    pub fn with_watch(mut self, enabled: bool) -> Self {
-        if enabled && self.watch.is_none() {
-            match watch::WatchManager::new(self.cache.clone(), self.events.clone()) {
-                Ok(w) => self.watch = Some(w),
-                Err(e) => eprintln!("veles watch: failed to start watcher: {e}"),
-            }
-        }
+    /// Set the workspace used by tool calls that omit `repo`.
+    pub fn with_default_repo(mut self, repo: impl Into<String>) -> Self {
+        self.default_repo = repo.into();
+        self
+    }
+
+    pub fn with_include_text_files(mut self, enabled: bool) -> Self {
+        self.include_text_files = enabled;
+        self
+    }
+
+    /// Retained for CLI compatibility. Automatic workspace freshness is
+    /// always enabled when the host supports filesystem watching.
+    pub fn with_watch(self, _enabled: bool) -> Self {
         self
     }
 
     /// Enable the optional per-repo web dashboard (`serve-mcp --dashboard`).
     ///
-    /// The dashboard port doubles as a **singleton election token**: the first
-    /// veles process to bind it becomes the *owner* (it watches + updates the
-    /// indexes and serves the dashboard); a second veles process finds the
-    /// port held by another veles and runs as a *follower* — no second
-    /// watcher, no second dashboard, no port fight. (If the port is held by an
-    /// unrelated service, we fall back to a free port and still own a
-    /// dashboard.) `open` makes the owner open the URL in a browser once.
-    ///
-    /// Requires the `dashboard` build feature; otherwise prints a notice.
-    pub fn with_dashboard(mut self, enabled: bool, port: u16, open: bool) -> Self {
-        self.dashboard_enabled = enabled;
-        self.dashboard_port = port;
-        self.dashboard_open = open;
-        let _ = open; // used only in the `dashboard` feature build
+    /// Dashboard transport is observability only and never participates in
+    /// repository coordination.
+    pub fn with_dashboard(self, enabled: bool, port: u16, open: bool) -> Self {
+        let _ = (port, open); // used only in the `dashboard` feature build
         if enabled {
             #[cfg(feature = "dashboard")]
-            match dashboard::elect(port) {
-                dashboard::Election::Owner(listener, addr) => {
+            match dashboard::bind(port) {
+                Ok((listener, addr)) => {
                     eprintln!("veles dashboard: http://{addr}");
                     dashboard::serve(
                         listener,
                         self.cache.clone(),
                         self.watch.clone(),
                         self.events.clone(),
+                        self.default_repo.clone(),
                     );
                     if open {
                         open_browser(&format!("http://{addr}"));
                     }
                 }
-                dashboard::Election::FollowAnotherVeles => {
-                    self.owner.store(false, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "veles dashboard: another veles already owns :{port}; running as a \
-                         follower (no dashboard, no watcher — reload-on-read keeps search fresh)"
-                    );
-                }
-                dashboard::Election::Foreign => {
-                    // Port squatted by a non-veles service: take a free port so
-                    // we still get a dashboard, and stay owner.
-                    if let dashboard::Election::Owner(listener, addr) = dashboard::elect(0) {
-                        eprintln!(
-                            "veles dashboard: :{port} held by a non-veles service; \
-                             serving on http://{addr} instead"
-                        );
-                        dashboard::serve(
-                            listener,
-                            self.cache.clone(),
-                            self.watch.clone(),
-                            self.events.clone(),
-                        );
-                        if open {
-                            open_browser(&format!("http://{addr}"));
-                        }
-                    } else {
-                        eprintln!("veles dashboard: could not bind any port; UI disabled");
-                    }
-                }
+                Err(e) => eprintln!("veles dashboard: UI disabled: {e}"),
             }
             #[cfg(not(feature = "dashboard"))]
             eprintln!(
@@ -601,76 +565,67 @@ impl McpServer {
         self
     }
 
-    /// Self-heal: when a follower handles a request, check whether the owner's
-    /// dashboard port has become free (the owner exited). If so, take it over
-    /// — bind the port, start the dashboard, and begin watching every repo
-    /// already loaded — so exactly one live process is always the owner.
-    #[cfg(feature = "dashboard")]
-    fn try_promote(&self) {
-        use std::sync::atomic::Ordering;
-        if !self.dashboard_enabled || self.owner.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some((listener, addr)) = dashboard::try_become_owner(self.dashboard_port) else {
-            return; // still owned by someone — stay a follower
-        };
-        // We hold the port. Claim ownership exactly once.
-        if self
-            .owner
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            eprintln!("veles dashboard: previous owner gone — promoting to owner at http://{addr}");
-            dashboard::serve(
-                listener,
-                self.cache.clone(),
-                self.watch.clone(),
-                self.events.clone(),
-            );
-            if let Some(w) = &self.watch {
-                for repo in self.cache.loaded_repos() {
-                    w.watch(&repo);
-                }
-            }
-        }
-        // If the CAS lost, another task promoted first; dropping `listener`
-        // frees the port — harmless, the winner already holds its own bind.
-    }
-
-    #[cfg(not(feature = "dashboard"))]
-    fn try_promote(&self) {}
-
     /// Publish a one-line activity event to the dashboard feed (best-effort).
     fn emit(&self, msg: impl Into<String>) {
         let _ = self.events.send(msg.into());
     }
 
+    fn repo_arg<'a>(&'a self, args: &'a Value) -> &'a str {
+        args["repo"].as_str().unwrap_or(&self.default_repo)
+    }
+
     /// Load (or build) the index for `repo`.
     ///
-    /// **Owner** processes register the repo with the watcher so on-disk edits
-    /// refresh it automatically. **Follower** processes (another veles owns
-    /// updating this index) don't watch — they `refresh_if_stale` first, so a
-    /// search reloads the persisted index the owner just rewrote without
-    /// re-embedding. A follower also attempts to self-promote here in case the
-    /// owner has exited.
+    /// Repository coordination is keyed by the canonical destination lock.
+    /// The lock holder builds, persists, and watches; concurrent MCP processes
+    /// load only committed generations and retry lock acquisition on access.
     async fn load_repo(
         &self,
         repo: &str,
     ) -> Result<Arc<tokio::sync::RwLock<veles_core::VelesIndex>>> {
-        use std::sync::atomic::Ordering;
-        if !self.owner.load(Ordering::Relaxed) {
-            self.try_promote();
-        }
-        if self.owner.load(Ordering::Relaxed) {
-            let index = self.cache.get_or_load(repo, false).await?;
-            if let Some(w) = &self.watch {
-                w.watch(repo);
-            }
-            Ok(index)
+        let repo_key = if repo.starts_with("http://") || repo.starts_with("https://") {
+            repo.to_string()
         } else {
-            // Follower: pick up any update the owner persisted since we loaded.
-            self.cache.refresh_if_stale(repo);
-            self.cache.get_or_load(repo, false).await
+            std::fs::canonicalize(repo)?.to_string_lossy().into_owned()
+        };
+        if repo_key.starts_with("http://") || repo_key.starts_with("https://") {
+            return self
+                .cache
+                .get_or_load(&repo_key, self.include_text_files)
+                .await;
+        }
+        let role = match &self.watch {
+            Some(coordinator) => coordinator.ensure(&repo_key)?,
+            None => watch::RepoRole::Writer,
+        };
+        match role {
+            watch::RepoRole::Writer => {
+                let index = self
+                    .cache
+                    .get_or_load(&repo_key, self.include_text_files)
+                    .await?;
+                if !repo_key.starts_with("http")
+                    && !veles_core::persist::index_exists(Path::new(&repo_key))
+                {
+                    index.read().await.save(Path::new(&repo_key))?;
+                }
+                Ok(index)
+            }
+            watch::RepoRole::Reader => {
+                for _ in 0..100 {
+                    if veles_core::persist::index_exists(Path::new(&repo_key)) {
+                        self.cache.refresh_if_stale(&repo_key);
+                        return self
+                            .cache
+                            .get_or_load(&repo_key, self.include_text_files)
+                            .await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                anyhow::bail!(
+                    "Veles is still preparing the index for {repo}; retry the request shortly"
+                )
+            }
         }
     }
 
@@ -681,7 +636,19 @@ impl McpServer {
     /// perf plan). The previous sync `BufRead.lines()` loop pinned a
     /// worker thread on `read(2)`; with async I/O the worker is free to
     /// run other tasks while we wait for input.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
+        let server = Arc::new(self);
+        let preload = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = preload.load_repo(&preload.default_repo).await {
+                eprintln!(
+                    "veles: could not prepare workspace {}: {e}",
+                    preload.default_repo
+                );
+            } else {
+                preload.emit(format!("workspace ready: {}", preload.default_repo));
+            }
+        });
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin).lines();
         let mut stdout = tokio::io::stdout();
@@ -711,7 +678,9 @@ impl McpServer {
                 }
             };
 
-            let response = self.handle_request(request).await;
+            let Some(response) = server.handle_request(request).await else {
+                continue;
+            };
             let response_str = serde_json::to_string(&response)?;
             stdout.write_all(response_str.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
@@ -721,19 +690,13 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         let id = request.id.clone();
 
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(request.params),
             "notifications/initialized" => {
-                // Client confirmed initialization — no response needed for notifications.
-                return JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    id,
-                    result: Some(Value::Null),
-                    error: None,
-                };
+                return None;
             }
             "tools/list" => self.handle_tools_list(),
             "tools/call" => self.handle_tools_call(request.params).await,
@@ -743,7 +706,7 @@ impl McpServer {
             }),
         };
 
-        match result {
+        Some(match result {
             Ok(value) => JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id,
@@ -756,7 +719,7 @@ impl McpServer {
                 result: None,
                 error: Some(error),
             },
-        }
+        })
     }
 
     fn handle_initialize(&self, _params: Option<Value>) -> Result<Value, JsonRpcError> {
@@ -814,7 +777,7 @@ impl McpServer {
             message: "Missing 'query' parameter".into(),
         })?;
 
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         self.emit(format!("search: {query:?} in {repo}"));
 
         let mode_str = args["mode"].as_str().unwrap_or("hybrid");
@@ -828,12 +791,10 @@ impl McpServer {
         let min_score = args["min_score"].as_f64();
         let format = args["format"].as_str().unwrap_or("default");
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let glob_paths =
@@ -877,16 +838,14 @@ impl McpServer {
             message: "Missing 'name' parameter".into(),
         })?;
 
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         let lang = string_array(&args, "lang");
         let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let mut hits: Vec<&Symbol> = index
@@ -924,14 +883,12 @@ impl McpServer {
             code: -32602,
             message: "Missing 'file_path' parameter".into(),
         })?;
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let mut hits = index.symbols_for_file(file_path);
@@ -956,16 +913,14 @@ impl McpServer {
             code: -32602,
             message: "Missing 'name' parameter".into(),
         })?;
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         let top_k = args["top_k"].as_u64().unwrap_or(10) as usize;
         let format = args["format"].as_str().unwrap_or("default");
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let mut defs: Vec<&Symbol> = index.symbols().iter().filter(|s| s.name == name).collect();
@@ -1079,14 +1034,12 @@ impl McpServer {
     }
 
     async fn handle_stats(&self, args: Value) -> Result<Value, JsonRpcError> {
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let stats = index.stats();
@@ -1119,7 +1072,7 @@ impl McpServer {
     }
 
     async fn handle_update(&self, args: Value) -> Result<Value, JsonRpcError> {
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         if repo.starts_with("https://") || repo.starts_with("http://") {
             return Err(JsonRpcError {
                 code: -32000,
@@ -1135,13 +1088,21 @@ impl McpServer {
             });
         }
         let path_buf = path.to_path_buf();
-
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
+        if let Some(coordinator) = &self.watch
+            && coordinator.role(repo).map_err(|e| JsonRpcError {
                 code: -32000,
                 message: e.to_string(),
-            })?;
+            })? == watch::RepoRole::Reader
+        {
+            return Ok(json!({
+                "content": [{"type": "text", "text": "This workspace is updated automatically by another Veles process. The current committed index will be reloaded automatically."}]
+            }));
+        }
+
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let mut index = index_arc.write().await;
 
         let started = std::time::Instant::now();
@@ -1191,19 +1152,17 @@ impl McpServer {
     }
 
     async fn handle_list_symbols(&self, args: Value) -> Result<Value, JsonRpcError> {
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
         let lang = string_array(&args, "lang");
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
         let limit = args["limit"].as_u64().unwrap_or(200) as usize;
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         // Resolve globs against the index's known file set. None means
@@ -1267,17 +1226,15 @@ impl McpServer {
     }
 
     async fn handle_files(&self, args: Value) -> Result<Value, JsonRpcError> {
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         let lang = string_array(&args, "lang");
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let glob_paths =
@@ -1343,14 +1300,12 @@ impl McpServer {
             code: -32602,
             message: "Missing 'line' parameter".into(),
         })? as usize;
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         // Innermost = symbol with the smallest range that still contains `line`.
@@ -1402,7 +1357,7 @@ impl McpServer {
             code: -32602,
             message: "Missing 'end_line' parameter".into(),
         })? as usize;
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
 
         if start_line == 0 {
             return Err(JsonRpcError {
@@ -1492,7 +1447,7 @@ impl McpServer {
     }
 
     async fn handle_status(&self, args: Value) -> Result<Value, JsonRpcError> {
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         if repo.starts_with("https://") || repo.starts_with("http://") {
             return Err(JsonRpcError {
                 code: -32000,
@@ -1577,19 +1532,17 @@ impl McpServer {
             message: "Missing 'line' parameter".into(),
         })? as usize;
 
-        let repo = args["repo"].as_str().unwrap_or(".");
+        let repo = self.repo_arg(&args);
         let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
         let format = args["format"].as_str().unwrap_or("default");
         let lang = string_array(&args, "lang");
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let index_arc = self.load_repo(repo)
-            .await
-            .map_err(|e| JsonRpcError {
-                code: -32000,
-                message: e.to_string(),
-            })?;
+        let index_arc = self.load_repo(repo).await.map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
         let index = index_arc.read().await;
 
         let chunk = index
@@ -1719,4 +1672,47 @@ fn format_results_unique_paths(results: &[veles_core::types::SearchResult]) -> S
         }
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialized_notification_has_no_response() {
+        let model = veles_core::model::load_model(None).expect("test model");
+        let server = McpServer::new(model);
+        let response = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: None,
+                method: "notifications/initialized".into(),
+                params: None,
+            })
+            .await;
+        assert!(response.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn include_text_files_reaches_automatic_workspace_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# searchable workspace note\n").unwrap();
+        let model = veles_core::model::load_model(None).expect("test model");
+        let server = McpServer::new(model)
+            .with_default_repo(dir.path().to_string_lossy().into_owned())
+            .with_include_text_files(true);
+
+        let index = server
+            .load_repo(dir.path().to_str().unwrap())
+            .await
+            .expect("prepare workspace");
+        let index = index.read().await;
+        assert!(
+            index
+                .chunks()
+                .iter()
+                .any(|chunk| chunk.file_path == "notes.md")
+        );
+        assert!(veles_core::persist::current_generation(dir.path()).is_some());
+    }
 }

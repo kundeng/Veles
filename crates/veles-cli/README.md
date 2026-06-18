@@ -49,9 +49,13 @@ Stable line-oriented formats are designed to compose with `xargs`,
 ## Servers
 
 ```sh
-veles serve-mcp                          # MCP over stdio for Claude / Cursor
+veles serve-mcp                          # automatic workspace search for coding agents
 veles serve-grpc --addr "[::1]:50051"    # gRPC service
 ```
+
+Configure `serve-mcp` once in the coding agent. Veles discovers that session's
+workspace, prepares the index, and keeps it current automatically. Concurrent
+agents share one repository-local updater.
 
 ## Shell integration
 

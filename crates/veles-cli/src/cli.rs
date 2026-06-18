@@ -180,24 +180,21 @@ pub enum Commands {
 
     /// Start an MCP server over stdio.
     ServeMcp {
-        /// Optional local path to pre-index at startup.
+        /// Workspace used when a tool omits `repo`, and preloaded for the
+        /// dashboard. Defaults to VELES_WORKSPACE, CLAUDE_PROJECT_DIR, then
+        /// the server process's current directory.
         path: Option<String>,
         /// Also index non-code text files.
         #[arg(long)]
         include_text_files: bool,
-        /// Watch each opened repo and incrementally refresh its index when
-        /// files change on disk, so search never serves a stale index within
-        /// a session. Debounced; ignores `.veles/` and standard heavy dirs.
+        /// Deprecated compatibility flag. Workspace updates are automatic.
         #[arg(long)]
         watch: bool,
         /// Serve a per-repo web dashboard (index health + live activity feed)
         /// on a localhost port. Requires a build with `--features dashboard`.
         #[arg(long)]
         dashboard: bool,
-        /// Dashboard port (0 = OS-chosen free port; the URL is logged). Also
-        /// the singleton election token: the process that binds it owns
-        /// watching + the dashboard; a second veles follows instead of
-        /// fighting for the port.
+        /// Dashboard port (0 = OS-chosen free port; the URL is logged).
         #[arg(long, default_value_t = 0)]
         dashboard_port: u16,
         /// Open the dashboard URL in a browser on startup (owner only, once).

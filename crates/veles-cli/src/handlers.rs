@@ -116,6 +116,7 @@ pub fn handle_index(
     if !path_buf.is_dir() {
         bail!("Path is not a directory: {path}");
     }
+    let _writer = acquire_writer(&path_buf, "veles index")?;
 
     if persist::index_exists(&path_buf) && !force {
         eprintln!(
@@ -147,6 +148,7 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     if !path_buf.is_dir() {
         bail!("Path is not a directory: {path}");
     }
+    let _writer = acquire_writer(&path_buf, "veles update")?;
     if !persist::index_exists(&path_buf) {
         bail!(
             "No index at {}/.veles. Run `veles index {path}` first.",
@@ -190,12 +192,30 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     Ok(())
 }
 
+fn acquire_writer(path: &std::path::Path, label: &str) -> Result<veles_core::lock::WriterLock> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match veles_core::lock::try_acquire(path, label, now)? {
+        veles_core::lock::LockOutcome::Acquired(writer) => Ok(writer),
+        veles_core::lock::LockOutcome::Held { holder } => {
+            bail!("Veles is already updating {} ({holder})", path.display())
+        }
+    }
+}
+
 pub fn handle_transform(config: String) -> Result<()> {
     let cfg_path = veles_core::pipeline::expand_tilde(&config);
     let raw = std::fs::read_to_string(&cfg_path)
         .with_context(|| format!("read pipeline config {}", cfg_path.display()))?;
-    let cfg: veles_core::pipeline::PipelineConfig = serde_json::from_str(&raw)
+    let mut cfg: veles_core::pipeline::PipelineConfig = serde_json::from_str(&raw)
         .with_context(|| format!("parse pipeline config {}", cfg_path.display()))?;
+    cfg.resolve_relative_to(
+        cfg_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -316,6 +336,11 @@ pub fn handle_status(path: String) -> Result<()> {
 
 pub fn handle_clean(path: String) -> Result<()> {
     let path_buf = PathBuf::from(&path);
+    if !persist::index_exists(&path_buf) {
+        println!("No index to remove at {}/.veles", path_buf.display());
+        return Ok(());
+    }
+    let _writer = acquire_writer(&path_buf, "veles clean")?;
     if persist::clean(&path_buf)? {
         println!("Removed {}/.veles", path_buf.display());
     } else {
@@ -499,13 +524,28 @@ pub async fn handle_serve_grpc(addr: String) -> Result<()> {
 }
 
 pub async fn handle_serve_mcp(
+    path: Option<String>,
+    include_text_files: bool,
     watch: bool,
     dashboard: bool,
     dashboard_port: u16,
     dashboard_open: bool,
 ) -> Result<()> {
+    let requested = path
+        .or_else(|| std::env::var("VELES_WORKSPACE").ok())
+        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok())
+        .unwrap_or_else(|| ".".to_string());
+    let workspace = std::fs::canonicalize(&requested)
+        .with_context(|| format!("resolve MCP workspace {requested:?}"))?;
+    if !workspace.is_dir() {
+        anyhow::bail!("MCP workspace is not a directory: {}", workspace.display());
+    }
+    let workspace = workspace.to_string_lossy().into_owned();
+
     let mdl = model::load_model(None)?;
     let server = veles_mcp::McpServer::new(mdl)
+        .with_default_repo(workspace)
+        .with_include_text_files(include_text_files)
         .with_watch(watch)
         .with_dashboard(dashboard, dashboard_port, dashboard_open);
     server.run().await?;
@@ -528,7 +568,7 @@ pub async fn handle_default() -> Result<()> {
         println!();
         Ok(())
     } else {
-        handle_serve_mcp(false, false, 0, false).await
+        handle_serve_mcp(None, false, true, false, 0, false).await
     }
 }
 

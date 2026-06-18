@@ -4,10 +4,14 @@
 //!
 //! ```text
 //! .veles/
-//!   manifest.json   - format version, model, per-file fingerprints
-//!   chunks.bin      - bincode Vec<Chunk>
-//!   bm25.bin        - bincode Bm25Index
-//!   dense.bin       - bincode DenseIndex
+//!   CURRENT         - atomically-published generation identifier
+//!   generations/
+//!     <id>/
+//!       manifest.json
+//!       chunks.bin
+//!       bm25.bin
+//!       dense.bin
+//!       symbols.bin
 //! ```
 //!
 //! The manifest records a (size, mtime, chunk_count) fingerprint per file so
@@ -16,6 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +45,8 @@ const CHUNKS_FILE: &str = "chunks.bin";
 const BM25_FILE: &str = "bm25.bin";
 const DENSE_FILE: &str = "dense.bin";
 const SYMBOLS_FILE: &str = "symbols.bin";
+const CURRENT_FILE: &str = "CURRENT";
+const GENERATIONS_DIR: &str = "generations";
 
 /// Cheap fingerprint for change detection.
 ///
@@ -149,9 +156,28 @@ pub fn index_dir_for(repo_root: &Path) -> PathBuf {
     repo_root.join(INDEX_DIR_NAME)
 }
 
+/// Current committed generation identifier, or `None` for a legacy flat
+/// index / a repository with no persisted index.
+pub fn current_generation(repo_root: &Path) -> Option<u64> {
+    let current = index_dir_for(repo_root).join(CURRENT_FILE);
+    fs::read_to_string(current).ok()?.trim().parse().ok()
+}
+
+fn generation_dir(repo_root: &Path, generation: u64) -> PathBuf {
+    index_dir_for(repo_root)
+        .join(GENERATIONS_DIR)
+        .join(generation.to_string())
+}
+
+fn active_index_dir(repo_root: &Path) -> PathBuf {
+    current_generation(repo_root)
+        .map(|generation| generation_dir(repo_root, generation))
+        .unwrap_or_else(|| index_dir_for(repo_root))
+}
+
 /// Returns true if a saved index appears to exist at the given path.
 pub fn index_exists(repo_root: &Path) -> bool {
-    let dir = index_dir_for(repo_root);
+    let dir = active_index_dir(repo_root);
     dir.join(MANIFEST_FILE).is_file()
         && dir.join(CHUNKS_FILE).is_file()
         && dir.join(BM25_FILE).is_file()
@@ -168,14 +194,9 @@ pub struct PersistedIndex {
     pub symbols: Vec<Symbol>,
 }
 
-/// Write all index artefacts to `<repo_root>/.veles/`.
-///
-/// Manifest goes first synchronously so a partial-failure left-over
-/// has the freshest pointer to "what was meant to be saved". The four
-/// bincode artefacts are then written in parallel via `rayon::join`
-/// nested 2×2 (§5.7 of the perf plan) — modern filesystems handle
-/// concurrent same-dir creates fine, and the per-file `BufWriter` +
-/// bincode encode work in CPU dominate I/O for large indexes.
+/// Write a complete immutable generation, then atomically publish it through
+/// `<repo_root>/.veles/CURRENT`. Readers resolve one generation and therefore
+/// never combine files from concurrent or interrupted saves.
 ///
 /// Also drops the previous `chunks.to_vec()` / `symbols.to_vec()`
 /// temporaries: slices implement `Serialize`, so we feed them in
@@ -188,10 +209,14 @@ pub fn save(
     dense: &DenseIndex,
     symbols: &[Symbol],
 ) -> Result<()> {
-    let dir = index_dir_for(repo_root);
-    fs::create_dir_all(&dir).with_context(|| format!("create index dir {}", dir.display()))?;
+    let index_dir = index_dir_for(repo_root);
+    let generations_dir = index_dir.join(GENERATIONS_DIR);
+    fs::create_dir_all(&generations_dir)
+        .with_context(|| format!("create generations dir {}", generations_dir.display()))?;
 
-    write_json(&dir.join(MANIFEST_FILE), manifest)?;
+    let generation = next_generation(repo_root);
+    let dir = generation_dir(repo_root, generation);
+    fs::create_dir_all(&dir).with_context(|| format!("create index dir {}", dir.display()))?;
 
     let chunks_path = dir.join(CHUNKS_FILE);
     let bm25_path = dir.join(BM25_FILE);
@@ -216,12 +241,21 @@ pub fn save(
     r2?;
     r3?;
     r4?;
+    write_json(&dir.join(MANIFEST_FILE), manifest)?;
+    sync_dir(&dir);
+
+    write_atomic_bytes(
+        &index_dir.join(CURRENT_FILE),
+        format!("{generation}\n").as_bytes(),
+    )?;
+    sync_dir(&index_dir);
+    cleanup_stale_generations(repo_root, generation);
     Ok(())
 }
 
 /// Load all index artefacts from `<repo_root>/.veles/`.
 pub fn load(repo_root: &Path) -> Result<PersistedIndex> {
-    let dir = index_dir_for(repo_root);
+    let dir = active_index_dir(repo_root);
     if !dir.is_dir() {
         bail!("No index found at {}", dir.display());
     }
@@ -255,7 +289,7 @@ pub fn load(repo_root: &Path) -> Result<PersistedIndex> {
 
 /// Read just the manifest (cheap — used by `status` and to check compatibility).
 pub fn load_manifest(repo_root: &Path) -> Result<Manifest> {
-    let dir = index_dir_for(repo_root);
+    let dir = active_index_dir(repo_root);
     read_json(&dir.join(MANIFEST_FILE))
 }
 
@@ -277,18 +311,27 @@ pub fn clean(repo_root: &Path) -> Result<bool> {
 /// against power loss; we then best-effort fsync the directory so the rename
 /// itself is durable. The per-dest writer lock guarantees no two writers race
 /// on the same `*.tmp` name.
-fn write_atomic(path: &Path, write_body: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> Result<()>) -> Result<()> {
+fn write_atomic(
+    path: &Path,
+    write_body: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> Result<()>,
+) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = path.with_extension(format!(
         "{}tmp",
-        path.extension().and_then(|e| e.to_str()).map(|e| format!("{e}.")).unwrap_or_default()
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default()
     ));
     {
         let f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         let mut w = std::io::BufWriter::new(f);
         write_body(&mut w)?;
-        let f = w.into_inner().with_context(|| format!("flush {}", tmp.display()))?;
-        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+        let f = w
+            .into_inner()
+            .with_context(|| format!("flush {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
     }
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
@@ -298,6 +341,54 @@ fn write_atomic(path: &Path, write_body: impl FnOnce(&mut std::io::BufWriter<fs:
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic(path, |w| {
+        w.write_all(bytes)
+            .with_context(|| format!("write {}", path.display()))
+    })
+}
+
+fn next_generation(repo_root: &Path) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    current_generation(repo_root)
+        .map(|current| now.max(current.saturating_add(1)))
+        .unwrap_or(now)
+}
+
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+fn cleanup_stale_generations(repo_root: &Path, current: u64) {
+    const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let root = index_dir_for(repo_root).join(GENERATIONS_DIR);
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(generation) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        if generation == current {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= MIN_AGE);
+        if old_enough {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

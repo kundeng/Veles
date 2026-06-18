@@ -169,7 +169,10 @@ mod tests {
         match try_acquire(dest, "pipeB", 2000).unwrap() {
             LockOutcome::Held { holder } => {
                 assert!(holder.contains("pid="), "holder diagnostics: {holder:?}");
-                assert!(holder.contains("label=pipeA"), "should name first holder: {holder:?}");
+                assert!(
+                    holder.contains("label=pipeA"),
+                    "should name first holder: {holder:?}"
+                );
             }
             LockOutcome::Acquired(_) => panic!("two writers acquired the same dest"),
         }

@@ -1,4 +1,4 @@
-//! Filesystem watcher → incremental auto-update for the MCP server.
+//! Hidden per-repository coordinator for automatic MCP workspace indexing.
 //!
 //! Keeps cached indexes fresh by invoking the existing
 //! [`veles_core::VelesIndex::update_from_path`] whenever files under a
@@ -14,8 +14,10 @@
 //!   ignored dirs) are filtered *relative to each watched root*, so the
 //!   index's own `save()` never retriggers an update loop.
 //!
-//! Watching is opt-in (`serve-mcp --watch`) and per-repo: only repos that
-//! are actually opened in the session are watched — never a whole tree.
+//! Every MCP process attempts the repository-local writer lock. Exactly one
+//! process watches and publishes updates for a repository; concurrent MCP
+//! processes read committed generations and can take over after the writer
+//! exits. Different repositories coordinate independently.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -24,10 +26,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
 
 use veles_core::cache::IndexCache;
+use veles_core::lock::{self, LockOutcome, WriterLock};
 use veles_core::walker::DEFAULT_IGNORED_DIRS;
 
 /// Quiet window before a burst of filesystem events triggers one update.
@@ -37,9 +40,29 @@ const DEBOUNCE: Duration = Duration::from_millis(1500);
 /// all watches (the debouncer's worker thread shuts down with it).
 pub struct WatchManager {
     debouncer: Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>,
-    /// canonical repo root → original cache key (the string the handlers
-    /// passed to `get_or_load`, which is how the cache is keyed).
-    watched: Arc<Mutex<HashMap<PathBuf, String>>>,
+    repos: Arc<Mutex<HashMap<PathBuf, RepoRegistration>>>,
+}
+
+struct RepoRegistration {
+    cache_key: String,
+    writer: Option<WriterLock>,
+    watching: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRole {
+    Writer,
+    Reader,
+}
+
+/// Per-repository coordination snapshot. Consumed only by the optional
+/// dashboard, so it is gated to avoid dead-code warnings in default builds.
+#[cfg(feature = "dashboard")]
+#[derive(Debug, Clone)]
+pub struct RepoStatus {
+    pub path: PathBuf,
+    pub role: RepoRole,
+    pub watching: bool,
 }
 
 impl WatchManager {
@@ -51,7 +74,8 @@ impl WatchManager {
         events: tokio::sync::broadcast::Sender<String>,
     ) -> Result<Arc<Self>> {
         let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
-        let watched: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let repos: Arc<Mutex<HashMap<PathBuf, RepoRegistration>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // notify worker thread: forward every changed path. Filtering is
         // done in the consumer, where we know which root a path belongs to.
@@ -66,7 +90,7 @@ impl WatchManager {
         })?;
 
         // Async consumer: batch → map paths to watched roots → incremental update.
-        let watched_c = watched.clone();
+        let repos_c = repos.clone();
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 // Drain whatever else is already queued into one batch.
@@ -79,16 +103,17 @@ impl WatchManager {
                 // dropping paths that fall under an ignored dir *relative
                 // to their root* (notably `.veles/` — avoids self-trigger).
                 let targets: HashSet<(PathBuf, String)> = {
-                    let w = watched_c.lock().unwrap();
+                    let repos = repos_c.lock().unwrap();
                     paths
                         .iter()
                         .filter_map(|p| {
-                            w.iter().find_map(|(root, key)| {
+                            repos.iter().find_map(|(root, registration)| {
+                                registration.writer.as_ref()?;
                                 let rel = p.strip_prefix(root).ok()?;
                                 if rel_is_ignored(rel) {
                                     None
                                 } else {
-                                    Some((root.clone(), key.clone()))
+                                    Some((root.clone(), registration.cache_key.clone()))
                                 }
                             })
                         })
@@ -124,46 +149,90 @@ impl WatchManager {
 
         Ok(Arc::new(Self {
             debouncer: Mutex::new(debouncer),
-            watched,
+            repos,
         }))
     }
 
-    /// Start watching `repo` (idempotent). `repo` is the same string the
-    /// handlers pass to `get_or_load`; we canonicalize it for path
-    /// matching but keep the original as the cache key. Remote URLs and
-    /// unreadable paths are ignored.
-    pub fn watch(&self, repo: &str) {
+    /// Ensure repository-local coordination. Exactly one process can retain
+    /// the destination writer lock; other MCP processes remain readers and
+    /// retry on later access so takeover is automatic after a writer exits.
+    pub fn ensure(&self, repo: &str) -> Result<RepoRole> {
         if repo.starts_with("http://") || repo.starts_with("https://") {
-            return;
+            return Ok(RepoRole::Reader);
         }
-        let canonical = match std::fs::canonicalize(repo) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        {
-            let mut w = self.watched.lock().unwrap();
-            if w.contains_key(&canonical) {
-                return; // already watching
+        let canonical = std::fs::canonicalize(repo)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut repos = self.repos.lock().unwrap();
+        if let Some(registration) = repos.get_mut(&canonical) {
+            if registration.writer.is_some() {
+                return Ok(RepoRole::Writer);
             }
-            w.insert(canonical.clone(), repo.to_string());
+            if let LockOutcome::Acquired(writer) =
+                lock::try_acquire(&canonical, "automatic workspace indexing", now)?
+            {
+                registration.writer = Some(writer);
+                registration.watching = self.start_watch(&canonical);
+                return Ok(RepoRole::Writer);
+            }
+            return Ok(RepoRole::Reader);
         }
+
+        let (writer, role) =
+            match lock::try_acquire(&canonical, "automatic workspace indexing", now)? {
+                LockOutcome::Acquired(writer) => (Some(writer), RepoRole::Writer),
+                LockOutcome::Held { .. } => (None, RepoRole::Reader),
+            };
+        let watching = writer.is_some() && self.start_watch(&canonical);
+        repos.insert(
+            canonical.clone(),
+            RepoRegistration {
+                cache_key: canonical.to_string_lossy().into_owned(),
+                writer,
+                watching,
+            },
+        );
+        Ok(role)
+    }
+
+    fn start_watch(&self, canonical: &Path) -> bool {
         if let Err(e) = self
             .debouncer
             .lock()
             .unwrap()
-            .watch(&canonical, RecursiveMode::Recursive)
+            .watch(canonical, RecursiveMode::Recursive)
         {
             eprintln!("veles watch: cannot watch {}: {e}", canonical.display());
-            self.watched.lock().unwrap().remove(&canonical);
+            false
         } else {
             eprintln!("veles watch: watching {}", canonical.display());
+            true
         }
     }
 
-    /// Repos currently watched (canonical paths) — for the dashboard.
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    pub fn watched_roots(&self) -> Vec<PathBuf> {
-        self.watched.lock().unwrap().keys().cloned().collect()
+    #[cfg(feature = "dashboard")]
+    pub fn statuses(&self) -> Vec<RepoStatus> {
+        self.repos
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, registration)| RepoStatus {
+                path: path.clone(),
+                role: if registration.writer.is_some() {
+                    RepoRole::Writer
+                } else {
+                    RepoRole::Reader
+                },
+                watching: registration.watching,
+            })
+            .collect()
+    }
+
+    pub fn role(&self, repo: &str) -> Result<RepoRole> {
+        self.ensure(repo)
     }
 }
 
@@ -203,14 +272,17 @@ mod tests {
         let cache = Arc::new(IndexCache::new(model));
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("alpha.rs"), "fn existing() {}\n").unwrap();
-        let repo = dir.path().to_string_lossy().into_owned();
+        let repo = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         // Prime the cache the way a first `search` would.
         cache.get_or_load(&repo, false).await.unwrap();
 
         let (events, _rx) = tokio::sync::broadcast::channel(16);
         let wm = WatchManager::new(cache.clone(), events).expect("watch manager");
-        wm.watch(&repo);
+        assert_eq!(wm.ensure(&repo).unwrap(), RepoRole::Writer);
 
         // Add a new file *after* watching has started.
         std::fs::write(
@@ -225,9 +297,53 @@ mod tests {
         let idx = cache.peek(&repo).expect("repo still cached");
         let guard = idx.read().await;
         assert!(
-            guard.chunks().iter().any(|c| c.file_path.contains("beta.rs")),
+            guard
+                .chunks()
+                .iter()
+                .any(|c| c.file_path.contains("beta.rs")),
             "watcher should have incrementally indexed beta.rs; files={:?}",
-            guard.chunks().iter().map(|c| &c.file_path).collect::<Vec<_>>()
+            guard
+                .chunks()
+                .iter()
+                .map(|c| &c.file_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordination_is_per_repository() {
+        let model = veles_core::model::load_model(None).expect("test model load");
+        let cache_a = Arc::new(IndexCache::new(model.clone()));
+        let cache_b = Arc::new(IndexCache::new(model));
+        let (events_a, _) = tokio::sync::broadcast::channel(16);
+        let (events_b, _) = tokio::sync::broadcast::channel(16);
+        let first = WatchManager::new(cache_a, events_a).unwrap();
+        let second = WatchManager::new(cache_b, events_b).unwrap();
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            first.ensure(repo_a.path().to_str().unwrap()).unwrap(),
+            RepoRole::Writer
+        );
+        assert_eq!(
+            second.ensure(repo_a.path().to_str().unwrap()).unwrap(),
+            RepoRole::Reader
+        );
+        assert_eq!(
+            second.ensure(repo_b.path().to_str().unwrap()).unwrap(),
+            RepoRole::Writer
+        );
+
+        first
+            .repos
+            .lock()
+            .unwrap()
+            .remove(&std::fs::canonicalize(repo_a.path()).unwrap());
+        assert_eq!(
+            second.ensure(repo_a.path().to_str().unwrap()).unwrap(),
+            RepoRole::Writer,
+            "a reader should take over after the previous writer releases the repo lock"
         );
     }
 }

@@ -407,12 +407,18 @@ For agent integration:
 
 ```sh
 # MCP over stdio (default if no subcommand is given)
-veles serve-mcp
+veles serve-mcp                # workspace is prepared and updated automatically
 veles                          # equivalent
 
 # gRPC
 veles serve-grpc --addr "[::1]:50051"
 ```
+
+The optional startup path becomes the default `repo` for every MCP tool. If
+omitted, Veles checks `VELES_WORKSPACE`, then `CLAUDE_PROJECT_DIR`, then the
+server process's current directory. Veles automatically prepares and watches
+the workspace. Multiple MCP processes share one updater per repository through
+repository-local coordination; no `--watch` or fixed dashboard port is needed.
 
 The MCP server exposes `search`, `defs`, `symbols`, `refs`, `stats`,
 `update`, and `find_related` as tools. `search` and `find_related`

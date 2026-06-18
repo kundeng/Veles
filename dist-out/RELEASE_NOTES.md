@@ -1,6 +1,19 @@
-Prebuilt **veles** binaries for the `feat/mcp-watch-dashboard` fork build — adds
-`serve-mcp --watch` (live incremental index) and `--dashboard` (per-repo web UI).
+Prebuilt **veles** binaries for the `feat/mcp-watch-dashboard` fork build —
+automatic, continuously updated workspace indexing for MCP clients plus an
+optional per-process dashboard.
 Built with `--features dashboard` from commit on branch `feat/mcp-watch-dashboard`.
+
+Normal MCP setup is now only:
+
+```sh
+veles serve-mcp
+```
+
+Veles discovers the workspace and hides repository writer coordination,
+watching, incremental updates, and safe index publication. Multiple MCP
+processes share one updater per repository; different repositories operate in
+parallel. `--watch` remains accepted for compatibility but is no longer
+required.
 
 This is a **rolling tag**: assets are replaced in place when a new fork build is cut,
 so the download URLs below stay stable.

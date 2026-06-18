@@ -23,8 +23,8 @@
 //!     "name": "agent-sessions",
 //!     "dest": "~/.veles-corpora/sessions",
 //!     "inputs": [
-//!       {"source": "~/.claude/projects/**/*.jsonl", "transform": ["python3","claude_distill.py"]},
-//!       {"source": "~/.codex/sessions/**/rollout-*.jsonl", "transform": ["python3","codex_distill.py"]}
+//!       {"name": "claude", "source": "~/.claude/projects/**/*.jsonl", "transform": ["python3","claude_distill.py"]},
+//!       {"name": "codex", "source": "~/.codex/sessions/**/rollout-*.jsonl", "transform": ["python3","codex_distill.py"]}
 //!     ]
 //!   }]
 //! }
@@ -35,19 +35,46 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use model2vec_rs::model::StaticModel;
 
+use crate::VelesIndex;
 use crate::lock::{self, LockOutcome};
 use crate::persist::{self, index_dir_for};
-use crate::VelesIndex;
 
 /// A whole pipeline: a list of independent stages.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
     pub stages: Vec<Stage>,
+}
+
+impl PipelineConfig {
+    /// Resolve relative source/destination paths against the config directory.
+    /// Transform arguments that name an existing relative file are resolved
+    /// too, so `python3 scripts/adapter.py` is stable across launch directories.
+    pub fn resolve_relative_to(&mut self, base: &Path) {
+        for stage in &mut self.stages {
+            stage.dest = resolve_config_path(base, &stage.dest)
+                .to_string_lossy()
+                .into_owned();
+            for input in &mut stage.inputs {
+                input.source = resolve_config_path(base, &input.source)
+                    .to_string_lossy()
+                    .into_owned();
+                for arg in &mut input.transform {
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    let candidate = expand_tilde(arg);
+                    if candidate.is_relative() && base.join(&candidate).exists() {
+                        *arg = base.join(candidate).to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One destination index, fed by one or more inputs and guarded by one lock.
@@ -69,6 +96,11 @@ pub struct Stage {
 /// indexable text.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Input {
+    /// Stable namespace under `dest`. Prevents two source trees with the same
+    /// relative paths from overwriting one another. Legacy configs may omit
+    /// it and receive an ordinal `input-N` namespace.
+    #[serde(default)]
+    pub name: String,
     /// Glob of source files (supports `~` and `**`).
     pub source: String,
     /// External transform: `[program, args...]`. veles appends the absolute
@@ -114,7 +146,11 @@ pub struct StageReport {
 }
 
 /// Run every stage of a pipeline once. `model` is cloned per stage.
-pub fn run_pipeline(cfg: &PipelineConfig, model: &StaticModel, now_epoch_secs: i64) -> Result<Vec<StageReport>> {
+pub fn run_pipeline(
+    cfg: &PipelineConfig,
+    model: &StaticModel,
+    now_epoch_secs: i64,
+) -> Result<Vec<StageReport>> {
     let mut reports = Vec::with_capacity(cfg.stages.len());
     for stage in &cfg.stages {
         reports.push(run_stage(stage, model, now_epoch_secs)?);
@@ -134,13 +170,18 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
     if stage.inputs.is_empty() {
         bail!("stage {:?} has no inputs", stage.name);
     }
-    for input in &stage.inputs {
+    let mut input_names = std::collections::HashSet::new();
+    for (input_index, input) in stage.inputs.iter().enumerate() {
         if input.transform.is_empty() {
             bail!(
                 "stage {:?} input {:?} has an empty transform; transform stages require a command",
                 stage.name,
                 input.source
             );
+        }
+        let name = effective_input_name(input, input_index);
+        if !input_names.insert(name.clone()) {
+            bail!("stage {:?} has duplicate input name {name:?}", stage.name);
         }
     }
 
@@ -160,7 +201,8 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
     let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 1. Derive: each input's matched sources → derived `.md` under dest.
-    for input in &stage.inputs {
+    for (input_index, input) in stage.inputs.iter().enumerate() {
+        let input_name = effective_input_name(input, input_index);
         let pattern = expand_tilde(&input.source);
         let (base, matcher) = glob_base_and_matcher(&pattern)?;
         for src in enumerate_sources(&base, &matcher) {
@@ -176,16 +218,15 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
             let mtime_secs = mtime_secs(&meta);
 
             // Quick skip: unchanged size+mtime and the derived file still exists.
-            if let Some(prev) = state.sources.get(&src_key) {
-                if prev.size == size
-                    && prev.mtime_secs == mtime_secs
-                    && dest.join(&prev.derived_rel).is_file()
-                {
-                    continue;
-                }
+            if let Some(prev) = state.sources.get(&src_key)
+                && prev.size == size
+                && prev.mtime_secs == mtime_secs
+                && dest.join(&prev.derived_rel).is_file()
+            {
+                continue;
             }
 
-            let derived_rel = derived_rel_path(&base, &src);
+            let derived_rel = derived_rel_path(&input_name, &base, &src);
             let derived_abs = dest.join(&derived_rel);
 
             match run_transform(&input.transform, &src) {
@@ -244,7 +285,11 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
 }
 
 /// Build or incrementally update the index at `dest`, returning (files, chunks).
-fn index_dest(dest: &Path, include_text_files: bool, model: &StaticModel) -> Result<(usize, usize)> {
+fn index_dest(
+    dest: &Path,
+    include_text_files: bool,
+    model: &StaticModel,
+) -> Result<(usize, usize)> {
     if persist::index_exists(dest) {
         let mut index = VelesIndex::load(dest, model.clone())?;
         let report = index.update_from_path(dest)?;
@@ -289,10 +334,10 @@ pub fn expand_tilde(s: &str) -> PathBuf {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(rest);
         }
-    } else if s == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
+    } else if s == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(s)
 }
@@ -344,9 +389,28 @@ fn enumerate_sources(base: &Path, matcher: &globset::GlobMatcher) -> Vec<PathBuf
 /// source's path under `base`, swapping the extension to `.md`. Keeps
 /// provenance legible (`<project>/<id>.md`) and lets `path:` scoping work,
 /// while veles stays format-blind.
-fn derived_rel_path(base: &Path, source: &Path) -> PathBuf {
+fn effective_input_name(input: &Input, index: usize) -> String {
+    let trimmed = input.name.trim();
+    if trimmed.is_empty() {
+        format!("input-{}", index + 1)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn resolve_config_path(base: &Path, value: &str) -> PathBuf {
+    let expanded = expand_tilde(value);
+    if expanded.is_relative() {
+        base.join(expanded)
+    } else {
+        expanded
+    }
+}
+
+fn derived_rel_path(namespace: &str, base: &Path, source: &Path) -> PathBuf {
     let rel = source.strip_prefix(base).unwrap_or(source);
-    let mut out = rel.to_path_buf();
+    let mut out = PathBuf::from(namespace);
+    out.push(rel);
     out.set_extension("md");
     out
 }
@@ -387,7 +451,8 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
             .unwrap_or_default()
     ));
     fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 #[cfg(test)]
@@ -404,8 +469,12 @@ mod tests {
 
     #[test]
     fn derived_mirrors_source_as_md() {
-        let d = derived_rel_path(Path::new("/src"), Path::new("/src/proj/sess.jsonl"));
-        assert_eq!(d, PathBuf::from("proj/sess.md"));
+        let d = derived_rel_path(
+            "codex",
+            Path::new("/src"),
+            Path::new("/src/proj/sess.jsonl"),
+        );
+        assert_eq!(d, PathBuf::from("codex/proj/sess.md"));
     }
 
     #[test]
@@ -424,6 +493,7 @@ mod tests {
             dest: dest.to_string_lossy().into_owned(),
             include_text_files: true,
             inputs: vec![Input {
+                name: "fixture".into(),
                 source: format!("{}/srcs/**/*.jsonl", tmp.path().to_string_lossy()),
                 transform: vec![
                     "sh".into(),
@@ -442,10 +512,77 @@ mod tests {
         assert!(r1.total_chunks >= 1, "expected indexed chunks, got {r1:?}");
         // Derived file mirrors source *below the glob base* as .md under dest:
         // base is `<tmp>/srcs`, so `srcs/projA/s1.jsonl` → `projA/s1.md`.
-        assert!(dest.join("projA/s1.md").is_file(), "derived not found under dest");
+        assert!(
+            dest.join("fixture/projA/s1.md").is_file(),
+            "derived not found under dest"
+        );
 
         // Re-run with no source change → quick-skip, nothing re-derived.
         let r2 = run_stage(&stage, &model, 1001).unwrap();
-        assert_eq!(r2.derived_written, 0, "unchanged source should skip: {r2:?}");
+        assert_eq!(
+            r2.derived_written, 0,
+            "unchanged source should skip: {r2:?}"
+        );
+    }
+
+    #[test]
+    fn inputs_with_matching_relative_paths_are_namespaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        for source in ["claude", "codex"] {
+            let dir = tmp.path().join(source).join("project");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("session.jsonl"), source).unwrap();
+        }
+        let dest = tmp.path().join("corpus");
+        let stage = Stage {
+            name: "sessions".into(),
+            dest: dest.to_string_lossy().into_owned(),
+            include_text_files: true,
+            inputs: ["claude", "codex"]
+                .into_iter()
+                .map(|name| Input {
+                    name: name.into(),
+                    source: format!("{}/{name}/**/*.jsonl", tmp.path().to_string_lossy()),
+                    transform: vec!["cat".into()],
+                })
+                .collect(),
+        };
+        let model = crate::model::load_model(None).expect("model");
+        run_stage(&stage, &model, 1).unwrap();
+
+        assert!(dest.join("claude/project/session.md").is_file());
+        assert!(dest.join("codex/project/session.md").is_file());
+    }
+
+    #[test]
+    fn config_paths_resolve_against_config_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        fs::write(tmp.path().join("scripts/adapter.py"), "").unwrap();
+        let mut config = PipelineConfig {
+            stages: vec![Stage {
+                name: "relative".into(),
+                dest: "derived".into(),
+                include_text_files: true,
+                inputs: vec![Input {
+                    name: "source".into(),
+                    source: "inputs/**/*.jsonl".into(),
+                    transform: vec!["python3".into(), "scripts/adapter.py".into()],
+                }],
+            }],
+        };
+        config.resolve_relative_to(tmp.path());
+        assert_eq!(
+            PathBuf::from(&config.stages[0].dest),
+            tmp.path().join("derived")
+        );
+        assert_eq!(
+            PathBuf::from(&config.stages[0].inputs[0].source),
+            tmp.path().join("inputs/**/*.jsonl")
+        );
+        assert_eq!(
+            PathBuf::from(&config.stages[0].inputs[0].transform[1]),
+            tmp.path().join("scripts/adapter.py")
+        );
     }
 }

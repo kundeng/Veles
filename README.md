@@ -194,13 +194,27 @@ veles search "BM25 inverted index" https://github.com/julymetodiev/Veles
 ```
 
 See **[USAGE.md](USAGE.md)** for the full reference, recipes (fzf, vim quickfix, jq), and troubleshooting.
+Maintainers can read the
+**[automatic workspace indexing specification](docs/design/automatic-workspace-indexing.md)**
+for lifecycle, concurrency, and persistence guarantees.
 
 ## MCP server
 
 ```sh
-veles serve-mcp     # explicit
+veles serve-mcp     # configure once; workspace indexing stays current automatically
 veles               # equivalent — bare `veles` starts MCP when stdin is piped
 ```
+
+No watcher, pipeline, owner, or dashboard configuration is required. Each
+coding-agent session discovers its workspace and shares one repository-local
+updater with any other Veles MCP processes for that repository. Different
+repositories remain independent.
+
+`serve-mcp [PATH]` optionally sets the default repo whenever an MCP tool omits
+`repo`. Without `PATH`, Veles checks
+`VELES_WORKSPACE`, `CLAUDE_PROJECT_DIR`, then the spawned process's current
+directory. Coding-agent configurations should pass the workspace explicitly
+or set the server `cwd`; see [`crates/veles-mcp/README.md`](crates/veles-mcp/README.md).
 
 Exposed tools:
 
