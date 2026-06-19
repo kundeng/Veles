@@ -366,27 +366,52 @@ fn sync_dir(dir: &Path) {
     }
 }
 
+/// Prune old index generations, retaining the current one and the single most
+/// recent previous (a reader may have resolved it just before the pointer swap).
+///
+/// Retention is **count-based**, not age-based. The old rule kept *every*
+/// generation younger than 24h, which is unbounded for a coordinator that saves
+/// on each change — a distilled-sessions coordinator saving every ~60s piled up
+/// tens of GB (293MB × 150+ generations). We keep the newest `KEEP_RECENT` by
+/// generation id and delete the rest once past a short `GRACE`, so a generation
+/// a reader resolved moments ago isn't yanked mid-read.
 fn cleanup_stale_generations(repo_root: &Path, current: u64) {
-    const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    /// Minimum age before a non-retained generation is deleted, protecting one a
+    /// reader resolved just before a rapid sequence of saves.
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+    prune_generations(repo_root, current, GRACE);
+}
+
+/// Inner pruner; `grace` is a parameter so tests can pass `Duration::ZERO`.
+fn prune_generations(repo_root: &Path, current: u64, grace: std::time::Duration) {
+    /// How many newest generations to retain (current + immediately previous).
+    const KEEP_RECENT: usize = 2;
+
     let root = index_dir_for(repo_root).join(GENERATIONS_DIR);
-    let Ok(entries) = fs::read_dir(root) else {
+    let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(generation) = entry.file_name().to_string_lossy().parse::<u64>() else {
-            continue;
-        };
-        if generation == current {
+    let mut gens: Vec<(u64, std::path::PathBuf, Option<SystemTime>)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let id = entry.file_name().to_string_lossy().parse::<u64>().ok()?;
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+            Some((id, entry.path(), mtime))
+        })
+        .collect();
+    // Newest first by generation id (monotonic), so the keep-set is deterministic
+    // regardless of filesystem mtime resolution.
+    gens.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (rank, (id, path, mtime)) in gens.iter().enumerate() {
+        if *id == current || rank < KEEP_RECENT {
             continue;
         }
-        let old_enough = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
+        let old_enough = mtime
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age >= MIN_AGE);
+            .is_some_and(|age| age >= grace);
         if old_enough {
-            let _ = fs::remove_dir_all(entry.path());
+            let _ = fs::remove_dir_all(path);
         }
     }
 }
@@ -614,6 +639,42 @@ impl UpdateReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_keeps_current_plus_one_previous_and_deletes_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gens = index_dir_for(tmp.path()).join(GENERATIONS_DIR);
+        // Five generations (ids 100..104), current = newest (104).
+        for id in [100u64, 101, 102, 103, 104] {
+            fs::create_dir_all(gens.join(id.to_string())).unwrap();
+        }
+        // grace = 0 so freshly-created dirs are eligible for deletion.
+        prune_generations(tmp.path(), 104, std::time::Duration::ZERO);
+
+        let remaining: std::collections::BTreeSet<u64> = fs::read_dir(&gens)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_string_lossy().parse::<u64>().ok())
+            .collect();
+        // Keep current (104) + immediately previous (103); drop 100/101/102.
+        assert_eq!(
+            remaining,
+            std::collections::BTreeSet::from([103, 104]),
+            "should retain only current + previous"
+        );
+    }
+
+    #[test]
+    fn prune_respects_grace_for_fresh_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gens = index_dir_for(tmp.path()).join(GENERATIONS_DIR);
+        for id in [1u64, 2, 3, 4] {
+            fs::create_dir_all(gens.join(id.to_string())).unwrap();
+        }
+        // Large grace: nothing is old enough, so even surplus generations survive.
+        prune_generations(tmp.path(), 4, std::time::Duration::from_secs(3600));
+        let count = fs::read_dir(&gens).unwrap().count();
+        assert_eq!(count, 4, "within grace, no generation is deleted");
+    }
 
     #[test]
     fn manifest_roundtrip_via_json() {
