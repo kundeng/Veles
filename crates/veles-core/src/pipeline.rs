@@ -284,21 +284,18 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
     Ok(report)
 }
 
-/// Distill every verbose-JSON file under `source` into derived `.md` mirrored
-/// in `dest`, then incrementally (re)index `dest`. The built-in counterpart to
-/// [`run_stage`]: same derive→drop-vanished→index machinery, but the transform
-/// is veles' own [`crate::distill`] (no external command, no Python) and the
-/// source format is fixed to verbose JSON.
+/// **Derive only** (no indexing): distill every verbose-JSON file under `source`
+/// into derived `.md` mirrored in `dest`, drop derived files whose source
+/// vanished, and persist the incremental state. Returns the report plus a
+/// `changed` flag (any file written or removed).
 ///
-/// **Lock-free by contract** — the caller (the coordinator) already holds the
-/// writer lock on `dest`. Acquiring it again here would self-deadlock. Safe to
-/// call repeatedly: unchanged sources quick-skip on `(size, mtime)`.
-pub fn run_distill_folder(
-    source: &Path,
-    dest: &Path,
-    model: &StaticModel,
-    _now_epoch_secs: i64,
-) -> Result<StageReport> {
+/// This is the half of the distill pipeline that the long-lived coordinator
+/// runs every tick: cheap (a `(size, mtime)` stat-scan when nothing changed).
+/// The coordinator owns a *resident* index and updates it in place only when
+/// `changed` is true — so it never reloads a large index just to poll.
+///
+/// **Lock-free by contract** — the caller already holds the writer lock on `dest`.
+pub fn derive_folder(source: &Path, dest: &Path) -> Result<(StageReport, bool)> {
     let mut report = StageReport {
         stage: format!("distill:{}", source.display()),
         ..Default::default()
@@ -371,15 +368,26 @@ pub fn run_distill_folder(
     }
 
     save_state(dest, &state)?;
+    let changed = report.derived_written > 0 || report.derived_removed > 0;
+    Ok((report, changed))
+}
 
-    // Skip the (expensive) reindex when nothing was re-derived and an index
-    // already exists. The distill coordinator re-runs this on a poll interval;
-    // a large session corpus changes rarely between ticks, and `index_dest`
-    // load+diffs the *whole* index every call. Loading a 50k+-chunk index every
-    // 10s pegged RSS (~3GB) and burned IO for no change. When the derive step
-    // touched nothing, the derived tree — and thus the index — is current, so
-    // report the committed counts from the cheap manifest and return.
-    if report.derived_written == 0 && report.derived_removed == 0 && persist::index_exists(dest) {
+/// Derive **and** index in one shot (the one-shot / first-build path): runs
+/// [`derive_folder`], then (re)indexes `dest` unless nothing changed and an
+/// index already exists. The long-lived coordinator does NOT use this — it
+/// derives and updates a resident index itself — but `veles`'s one-shot callers
+/// and tests want the combined behavior.
+pub fn run_distill_folder(
+    source: &Path,
+    dest: &Path,
+    model: &StaticModel,
+    _now_epoch_secs: i64,
+) -> Result<StageReport> {
+    let (mut report, changed) = derive_folder(source, dest)?;
+
+    // Nothing changed and an index already exists → the index is current; report
+    // counts from the cheap manifest instead of loading + diffing the whole index.
+    if !changed && persist::index_exists(dest) {
         if let Ok(manifest) = persist::load_manifest(dest) {
             report.indexed_files = manifest.files.len();
             report.total_chunks = manifest.total_chunks;
