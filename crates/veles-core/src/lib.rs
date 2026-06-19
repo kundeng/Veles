@@ -98,8 +98,10 @@
 
 pub mod cache;
 pub mod chunker;
+pub mod distill;
 pub mod filter;
 pub mod index;
+pub mod ingest;
 pub mod lease;
 pub mod lock;
 pub mod model;
