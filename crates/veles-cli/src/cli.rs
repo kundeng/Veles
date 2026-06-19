@@ -157,6 +157,19 @@ pub enum Commands {
         config: String,
     },
 
+    /// Add a folder to a workspace's read-set so it joins searches — live, no
+    /// restart. The folder gets its own coordinator (started now); a
+    /// verbose-JSON folder (e.g. agent transcripts) is distilled automatically.
+    /// Equivalent to the dashboard's "add repo" button or hand-editing
+    /// `<workspace>/.veles/config.toml [related]`.
+    Add {
+        /// Folder to add (absolute or relative to the workspace).
+        folder: String,
+        /// Workspace whose read-set gains the folder (default: current dir).
+        #[arg(long, default_value = ".")]
+        repo: String,
+    },
+
     /// Show stats about the persisted index at `<path>/.veles/`.
     Status {
         /// Local path of the indexed repo (default: current directory).

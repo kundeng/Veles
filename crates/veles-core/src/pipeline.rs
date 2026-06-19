@@ -284,6 +284,121 @@ pub fn run_stage(stage: &Stage, model: &StaticModel, now_epoch_secs: i64) -> Res
     Ok(report)
 }
 
+/// Distill every verbose-JSON file under `source` into derived `.md` mirrored
+/// in `dest`, then incrementally (re)index `dest`. The built-in counterpart to
+/// [`run_stage`]: same derive→drop-vanished→index machinery, but the transform
+/// is veles' own [`crate::distill`] (no external command, no Python) and the
+/// source format is fixed to verbose JSON.
+///
+/// **Lock-free by contract** — the caller (the coordinator) already holds the
+/// writer lock on `dest`. Acquiring it again here would self-deadlock. Safe to
+/// call repeatedly: unchanged sources quick-skip on `(size, mtime)`.
+pub fn run_distill_folder(
+    source: &Path,
+    dest: &Path,
+    model: &StaticModel,
+    _now_epoch_secs: i64,
+) -> Result<StageReport> {
+    let mut report = StageReport {
+        stage: format!("distill:{}", source.display()),
+        ..Default::default()
+    };
+    fs::create_dir_all(dest).with_context(|| format!("create dest {}", dest.display()))?;
+
+    let mut state = load_state(dest);
+    let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for src in enumerate_json_files(source) {
+        report.sources_seen += 1;
+        let src_key = src.to_string_lossy().into_owned();
+        alive.insert(src_key.clone());
+
+        let meta = match fs::metadata(&src) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = meta.len();
+        let mtime_secs = mtime_secs(&meta);
+
+        if let Some(prev) = state.sources.get(&src_key)
+            && prev.size == size
+            && prev.mtime_secs == mtime_secs
+            && dest.join(&prev.derived_rel).is_file()
+        {
+            continue;
+        }
+
+        let derived_rel = derived_rel_path("", source, &src);
+        let derived_abs = dest.join(&derived_rel);
+        match crate::distill::distill_file(&src) {
+            Some(text) => {
+                if let Some(parent) = derived_abs.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                write_atomic_bytes(&derived_abs, text.as_bytes())
+                    .with_context(|| format!("write derived {}", derived_abs.display()))?;
+                state.sources.insert(
+                    src_key,
+                    SourceState {
+                        size,
+                        mtime_secs,
+                        derived_rel: derived_rel.to_string_lossy().into_owned(),
+                    },
+                );
+                report.derived_written += 1;
+            }
+            None => {
+                report.transform_failures += 1;
+                eprintln!("veles distill: could not read {}", src.display());
+            }
+        }
+    }
+
+    // Drop derived files whose source vanished.
+    let gone: Vec<String> = state
+        .sources
+        .keys()
+        .filter(|k| !alive.contains(*k))
+        .cloned()
+        .collect();
+    for k in gone {
+        if let Some(s) = state.sources.remove(&k) {
+            let p = dest.join(&s.derived_rel);
+            if fs::remove_file(&p).is_ok() {
+                report.derived_removed += 1;
+            }
+        }
+    }
+
+    save_state(dest, &state)?;
+
+    let stats = index_dest(dest, true, model)?;
+    report.indexed_files = stats.0;
+    report.total_chunks = stats.1;
+    Ok(report)
+}
+
+/// Walk `source` for files veles treats as verbose JSON, skipping `.veles`/`.git`.
+fn enumerate_json_files(source: &Path) -> Vec<PathBuf> {
+    if !source.exists() {
+        return Vec::new();
+    }
+    walkdir::WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            !matches!(
+                e.file_name().to_str(),
+                Some(".veles") | Some(".git") | Some("node_modules")
+            )
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| crate::distill::is_json_ext(p))
+        .collect()
+}
+
 /// Build or incrementally update the index at `dest`, returning (files, chunks).
 fn index_dest(
     dest: &Path,

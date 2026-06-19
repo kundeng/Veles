@@ -18,7 +18,8 @@ use anyhow::{Context, Result};
 use model2vec_rs::model::StaticModel;
 
 use veles_core::cache::IndexCache;
-use veles_core::{lease, persist, runtime};
+use veles_core::ingest::{self, IngestMode};
+use veles_core::{lease, lock, persist, pipeline, runtime};
 
 use crate::watch::{RepoRole, WatchManager};
 
@@ -73,6 +74,16 @@ pub async fn run(
     let _ = (dashboard, dashboard_port, dashboard_open); // used in the `dashboard` build
     let canonical = std::fs::canonicalize(&repo)
         .with_context(|| format!("resolve coordinator repo {repo:?}"))?;
+
+    // Decide how this folder is ingested. A verbose-JSON folder (e.g. agent
+    // transcripts) is distilled into a veles-owned shadow index instead of
+    // being indexed in place; the source folder is never written to.
+    let plan = ingest::establish_plan(&canonical)
+        .with_context(|| format!("resolve ingest plan for {}", canonical.display()))?;
+    if plan.mode == IngestMode::Distill {
+        return run_distill(model, plan).await;
+    }
+
     let key = canonical.to_string_lossy().into_owned();
     let started = now_epoch_secs();
 
@@ -163,5 +174,83 @@ pub async fn run(
     runtime::remove(&canonical);
     // Dropping `watch` here releases the writer lock; process exit would too.
     drop(watch);
+    Ok(())
+}
+
+/// Coordinator loop for a **distill** folder: derive verbose JSON into the
+/// shadow index root and keep it fresh by polling.
+///
+/// Unlike the in-place path this does not use [`WatchManager`]: it watches the
+/// *source* but writes the *derived shadow*, so it owns the writer lock on the
+/// shadow root directly and re-runs the (incremental) distill each tick. That
+/// satisfies "periodically check and refresh the transformation" cheaply —
+/// unchanged sources quick-skip on `(size, mtime)` and unchanged derived files
+/// quick-skip on content hash.
+async fn run_distill(model: StaticModel, plan: ingest::Plan) -> Result<()> {
+    let source = plan.source;
+    let root = plan.index_root; // the shadow derived dir
+    let started = now_epoch_secs();
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create shadow index root {}", root.display()))?;
+
+    // Sole-writer on the shadow root (not the source). Stand down if another
+    // coordinator already owns it.
+    let _guard = match lock::try_acquire(&root, "distill", started)? {
+        lock::LockOutcome::Acquired(g) => g,
+        lock::LockOutcome::Held { holder } => {
+            eprintln!(
+                "veles coordinator: {} already has a writer ({holder}); exiting",
+                root.display()
+            );
+            return Ok(());
+        }
+    };
+    eprintln!(
+        "veles coordinator: distilling {} → {} (pid {})",
+        source.display(),
+        root.display(),
+        std::process::id()
+    );
+
+    let run_once = |when: i64| -> Result<()> {
+        let report = pipeline::run_distill_folder(&source, &root, &model, when)?;
+        eprintln!(
+            "veles distill: {} source(s), +{} derived, -{} removed, {} failure(s) — {} files / {} chunks",
+            report.sources_seen,
+            report.derived_written,
+            report.derived_removed,
+            report.transform_failures,
+            report.indexed_files,
+            report.total_chunks,
+        );
+        Ok(())
+    };
+
+    // Initial build + publish so readers have a committed generation promptly.
+    run_once(started)?;
+    runtime::write(&root, &runtime_state(&root, "watching", None, started))?;
+
+    let check_interval = secs_env("VELES_COORD_CHECK_SECS", CHECK_INTERVAL);
+    let startup_grace = secs_env("VELES_COORD_STARTUP_GRACE_SECS", STARTUP_GRACE);
+    let begin = Instant::now();
+    loop {
+        tokio::time::sleep(check_interval).await;
+        // Re-derive + re-index (incremental); publishes a new generation only
+        // when something actually changed.
+        if let Err(e) = run_once(now_epoch_secs()) {
+            eprintln!("veles distill: refresh failed: {e}");
+        }
+        let _ = runtime::write(&root, &runtime_state(&root, "watching", None, started));
+        let fresh = lease::count_fresh(&root);
+        if fresh == 0 && begin.elapsed() > startup_grace {
+            eprintln!(
+                "veles coordinator: no active readers for {}; exiting",
+                root.display()
+            );
+            break;
+        }
+    }
+
+    runtime::remove(&root);
     Ok(())
 }

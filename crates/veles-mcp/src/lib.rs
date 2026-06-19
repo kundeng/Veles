@@ -497,10 +497,16 @@ pub struct McpServer {
     /// Stable lease id for this reader process (one filename per repo).
     reader_id: String,
     /// Additional repositories searched alongside `default_repo` when a tool
-    /// omits `repo`. Loaded from `<default_repo>/.veles/config.toml [related]`.
+    /// omits `repo`. Loaded from `<default_repo>/.veles/config.toml [related]`
+    /// and **re-read live** whenever that file changes (see
+    /// [`McpServer::reload_related_if_changed`]) — so adding a repo from the
+    /// dashboard, `veles add`, or a hand edit takes effect without a restart.
     /// Empty by default — an MCP reads only its own workspace unless the user
     /// explicitly declares related repos.
-    related: Vec<String>,
+    related: std::sync::RwLock<Vec<String>>,
+    /// mtime of the read-set config last loaded, to skip re-parsing when
+    /// unchanged. `None` until first checked.
+    related_mtime: Mutex<Option<std::time::SystemTime>>,
     /// Live activity feed; retained for `emit` call sites (best-effort no-op
     /// now that the dashboard lives in the coordinator).
     events: tokio::sync::broadcast::Sender<String>,
@@ -521,7 +527,8 @@ impl McpServer {
             dashboard: (false, 0, false),
             leases: Mutex::new(HashMap::new()),
             reader_id: format!("mcp-{}", std::process::id()),
-            related: Vec::new(),
+            related: std::sync::RwLock::new(Vec::new()),
+            related_mtime: Mutex::new(None),
             events,
         }
     }
@@ -530,15 +537,42 @@ impl McpServer {
     /// `[related]` read-set from `<repo>/.veles/config.toml`.
     pub fn with_default_repo(mut self, repo: impl Into<String>) -> Self {
         self.default_repo = repo.into();
-        self.related = load_related_repos(&self.default_repo);
-        if !self.related.is_empty() {
+        let related = load_related_repos(&self.default_repo);
+        if !related.is_empty() {
             eprintln!(
                 "veles: read-set includes {} related repo(s): {}",
-                self.related.len(),
-                self.related.join(", ")
+                related.len(),
+                related.join(", ")
             );
         }
+        *self.related_mtime.get_mut().unwrap() = related_config_mtime(&self.default_repo);
+        *self.related.get_mut().unwrap() = related;
         self
+    }
+
+    /// Re-read the `[related]` read-set if `<default_repo>/.veles/config.toml`
+    /// changed since we last loaded it. Cheap (one `stat`) on the hot path;
+    /// makes dashboard / `veles add` / hand edits live without a restart.
+    fn reload_related_if_changed(&self) {
+        let current = related_config_mtime(&self.default_repo);
+        {
+            let mut last = self.related_mtime.lock().unwrap();
+            if *last == current {
+                return;
+            }
+            *last = current;
+        }
+        let related = load_related_repos(&self.default_repo);
+        eprintln!(
+            "veles: read-set reloaded — {} related repo(s){}",
+            related.len(),
+            if related.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", related.join(", "))
+            }
+        );
+        *self.related.write().unwrap() = related;
     }
 
     pub fn with_include_text_files(mut self, enabled: bool) -> Self {
@@ -576,9 +610,11 @@ impl McpServer {
         if let Some(r) = args.get("repo").and_then(|v| v.as_str()) {
             return vec![r.to_string()];
         }
-        let mut set = Vec::with_capacity(1 + self.related.len());
+        self.reload_related_if_changed();
+        let related = self.related.read().unwrap();
+        let mut set = Vec::with_capacity(1 + related.len());
         set.push(self.default_repo.clone());
-        set.extend(self.related.iter().cloned());
+        set.extend(related.iter().cloned());
         set
     }
 
@@ -608,13 +644,18 @@ impl McpServer {
 
         self.ensure_reader(&repo_key);
 
-        // Wait briefly for the coordinator to publish a first generation.
+        // Wait briefly for the coordinator to publish a first generation. The
+        // index may live in a veles-owned shadow (verbose-JSON folders are
+        // distilled), so read through `index_root` — recomputed each tick
+        // because the resolution sharpens once the coordinator persists a plan.
         for _ in 0..100 {
-            if veles_core::persist::index_exists(Path::new(&repo_key)) {
-                self.cache.refresh_if_stale(&repo_key);
+            let idx_root = veles_core::ingest::index_root(Path::new(&repo_key));
+            let idx_key = idx_root.to_string_lossy().into_owned();
+            if veles_core::persist::index_exists(&idx_root) {
+                self.cache.refresh_if_stale(&idx_key);
                 return self
                     .cache
-                    .get_or_load(&repo_key, self.include_text_files)
+                    .get_or_load(&idx_key, self.include_text_files)
                     .await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -624,17 +665,24 @@ impl McpServer {
 
     /// Ensure this process is a registered reader of `repo_key`: hold a fresh
     /// lease, and make sure a coordinator daemon is running for it.
+    ///
+    /// The lease and writer-lock probe target the **index root** (the shadow
+    /// dir for a distilled folder, the folder itself otherwise) so a distill
+    /// coordinator — which owns the lock on the shadow, not the source — is
+    /// seen as live and its idle-exit counts this reader. The coordinator is
+    /// still spawned on the *source* path; it resolves the plan itself.
     fn ensure_reader(&self, repo_key: &str) {
-        let repo_path = Path::new(repo_key);
+        let idx_root = veles_core::ingest::index_root(Path::new(repo_key));
+        let lease_key = idx_root.to_string_lossy().into_owned();
         {
             let mut leases = self.leases.lock().unwrap();
-            match leases.get(repo_key) {
+            match leases.get(&lease_key) {
                 Some(lease) => {
                     let _ = lease.refresh();
                 }
-                None => match ReaderLease::acquire(repo_path, &self.reader_id) {
+                None => match ReaderLease::acquire(&idx_root, &self.reader_id) {
                     Ok(lease) => {
-                        leases.insert(repo_key.to_string(), lease);
+                        leases.insert(lease_key, lease);
                     }
                     Err(e) => eprintln!("veles: could not create reader lease for {repo_key}: {e}"),
                 },
@@ -643,77 +691,14 @@ impl McpServer {
         // Spawn a coordinator only if none is currently writing. A racing
         // double-spawn is harmless — both daemons contend on the writer lock
         // and the loser stands down.
-        if !lock::is_writer_active(repo_path) {
+        if !lock::is_writer_active(&idx_root) {
             self.spawn_coordinator(repo_key);
         }
     }
 
-    /// Spawn a detached `veles coordinator <repo>` subprocess. It outlives this
-    /// MCP process (its own process group) and logs to `<repo>/.veles/coordinator.log`.
+    /// Spawn a detached coordinator using this server's preferences.
     fn spawn_coordinator(&self, repo_key: &str) {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("veles: cannot locate veles binary to spawn coordinator: {e}");
-                return;
-            }
-        };
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("coordinator").arg(repo_key);
-        if self.include_text_files {
-            cmd.arg("--include-text-files");
-        }
-        // Translate our dashboard preference into the coordinator's flag
-        // vocabulary (dashboard + auto-open are on by default in a
-        // `--features dashboard` coordinator, so we only pass the negations
-        // and an explicit port preference).
-        let (dash, port, open) = self.dashboard;
-        if dash {
-            cmd.arg("--dashboard");
-            if port != 0 {
-                cmd.arg("--dashboard-port").arg(port.to_string());
-            }
-            if !open {
-                cmd.arg("--no-dashboard-open");
-            }
-        } else {
-            cmd.arg("--no-dashboard");
-        }
-        // Detach: own process group, stdin null, logs to a file in .veles.
-        cmd.stdin(std::process::Stdio::null());
-        let log = veles_core::persist::index_dir_for(Path::new(repo_key)).join("coordinator.log");
-        if let Some(dir) = log.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-        {
-            Ok(f) => match f.try_clone() {
-                Ok(err) => {
-                    cmd.stdout(std::process::Stdio::from(f));
-                    cmd.stderr(std::process::Stdio::from(err));
-                }
-                Err(_) => {
-                    cmd.stdout(std::process::Stdio::from(f));
-                    cmd.stderr(std::process::Stdio::null());
-                }
-            },
-            Err(_) => {
-                cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::process::Stdio::null());
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        match cmd.spawn() {
-            Ok(_) => eprintln!("veles: spawned coordinator for {repo_key}"),
-            Err(e) => eprintln!("veles: failed to spawn coordinator for {repo_key}: {e}"),
-        }
+        spawn_coordinator_detached(repo_key, self.include_text_files, self.dashboard);
     }
 
     /// Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
@@ -1705,6 +1690,13 @@ struct RelatedConfig {
     repos: Vec<String>,
 }
 
+/// mtime of `<workspace>/.veles/config.toml`, or `None` if it doesn't exist.
+/// Used to detect read-set edits without re-parsing the file every request.
+fn related_config_mtime(workspace: &str) -> Option<std::time::SystemTime> {
+    let cfg_path = veles_core::persist::index_dir_for(Path::new(workspace)).join("config.toml");
+    std::fs::metadata(&cfg_path).and_then(|m| m.modified()).ok()
+}
+
 /// Load and canonicalize the `[related]` read-set from
 /// `<workspace>/.veles/config.toml`. Relative repo paths resolve against the
 /// workspace. An absent/unreadable/invalid config, or an unresolvable repo, is
@@ -1740,6 +1732,164 @@ fn load_related_repos(workspace: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Append `repo_path` to the `[related].repos` array of
+/// `<workspace>/.veles/config.toml`, preserving the file's comments and layout.
+///
+/// Resolves `repo_path` (absolute, or relative to `workspace`), validates it is
+/// a directory distinct from the workspace, and dedupes by canonical path.
+/// Idempotent: an already-listed repo is a no-op success. This is the single
+/// persistence path shared by the dashboard's "add repo" button and the
+/// `veles add` CLI; because the server re-reads the config when it changes, the
+/// addition is live. Returns a human-readable status message.
+pub fn persist_related_repo(workspace: &str, repo_path: &str) -> Result<String, String> {
+    let repo_path = repo_path.trim();
+    if repo_path.is_empty() {
+        return Err("enter a repository path".into());
+    }
+    let ws = Path::new(workspace);
+    let candidate = if Path::new(repo_path).is_absolute() {
+        PathBuf::from(repo_path)
+    } else {
+        ws.join(repo_path)
+    };
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|e| format!("cannot resolve {repo_path:?}: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    let canonical_str = canonical.to_string_lossy().into_owned();
+    if canonical_str == workspace {
+        return Err("that is the current workspace, not a related repo".into());
+    }
+
+    let cfg_dir = veles_core::persist::index_dir_for(ws);
+    std::fs::create_dir_all(&cfg_dir)
+        .map_err(|e| format!("cannot create {}: {e}", cfg_dir.display()))?;
+    let cfg_path = cfg_dir.join("config.toml");
+    let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("{} is malformed: {e}", cfg_path.display()))?;
+
+    let related = doc
+        .entry("related")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let related_tbl = related
+        .as_table_mut()
+        .ok_or("`related` in config.toml is not a table")?;
+    let repos_item =
+        related_tbl
+            .entry("repos")
+            .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
+                toml_edit::Array::new(),
+            )));
+    let arr = repos_item
+        .as_array_mut()
+        .ok_or("`related.repos` in config.toml is not an array")?;
+
+    // Dedupe by canonical path, resolving existing entries the same way the
+    // loader (`load_related_repos`) does so relative/absolute forms collapse.
+    for v in arr.iter() {
+        if let Some(s) = v.as_str() {
+            let existing = if Path::new(s).is_absolute() {
+                PathBuf::from(s)
+            } else {
+                ws.join(s)
+            };
+            if std::fs::canonicalize(&existing)
+                .ok()
+                .map(|c| c.to_string_lossy().into_owned())
+                .as_deref()
+                == Some(canonical_str.as_str())
+            {
+                return Ok(format!("{canonical_str} is already in the read-set"));
+            }
+        }
+    }
+    arr.push(canonical_str.as_str());
+
+    std::fs::write(&cfg_path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", cfg_path.display()))?;
+
+    Ok(format!(
+        "added {canonical_str} to the read-set — it will be indexed and searchable shortly"
+    ))
+}
+
+/// Spawn a detached `veles coordinator <repo>` subprocess. It outlives the
+/// caller (its own process group), logs to `<index-root>/.veles/coordinator.log`
+/// (the shadow for a distilled folder, so a non-owned source dir never gets a
+/// stray `.veles/`), and stands down if another coordinator already owns the
+/// repo. Shared by the MCP reader's lazy spawn and the `veles add` CLI.
+pub fn spawn_coordinator_detached(
+    repo_key: &str,
+    include_text_files: bool,
+    dashboard: (bool, u16, bool),
+) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("veles: cannot locate veles binary to spawn coordinator: {e}");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("coordinator").arg(repo_key);
+    if include_text_files {
+        cmd.arg("--include-text-files");
+    }
+    // Translate the dashboard preference into the coordinator's flag vocabulary
+    // (dashboard + auto-open are on by default in a `--features dashboard`
+    // coordinator, so we only pass the negations and an explicit port).
+    let (dash, port, open) = dashboard;
+    if dash {
+        cmd.arg("--dashboard");
+        if port != 0 {
+            cmd.arg("--dashboard-port").arg(port.to_string());
+        }
+        if !open {
+            cmd.arg("--no-dashboard-open");
+        }
+    } else {
+        cmd.arg("--no-dashboard");
+    }
+    cmd.stdin(std::process::Stdio::null());
+    let idx_root = veles_core::ingest::index_root(Path::new(repo_key));
+    let log = veles_core::persist::index_dir_for(&idx_root).join("coordinator.log");
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+    {
+        Ok(f) => match f.try_clone() {
+            Ok(err) => {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::from(err));
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::null());
+            }
+        },
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    match cmd.spawn() {
+        Ok(_) => eprintln!("veles: spawned coordinator for {repo_key}"),
+        Err(e) => eprintln!("veles: failed to spawn coordinator for {repo_key}: {e}"),
+    }
 }
 
 /// Short label for a repo path (its final component), used to qualify hit

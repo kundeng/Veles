@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
 
         Some(Commands::Transform { config }) => handlers::handle_transform(config),
 
+        Some(Commands::Add { folder, repo }) => handlers::handle_add(folder, repo),
+
         Some(Commands::Status { path }) => handlers::handle_status(path),
 
         Some(Commands::Clean { path }) => handlers::handle_clean(path),

@@ -247,6 +247,33 @@ pub fn handle_transform(config: String) -> Result<()> {
     Ok(())
 }
 
+/// `veles add <folder> [--repo <workspace>]`: persist the folder into the
+/// workspace's `[related]` read-set and start a coordinator for it now, so it
+/// is indexed and searchable without restarting any MCP server. The folder is
+/// distilled automatically if it looks like verbose JSON.
+pub fn handle_add(folder: String, repo: String) -> Result<()> {
+    let ws_canonical = std::fs::canonicalize(&repo)
+        .with_context(|| format!("resolve workspace {repo:?}"))?
+        .to_string_lossy()
+        .into_owned();
+    match veles_mcp::persist_related_repo(&ws_canonical, &folder) {
+        Ok(msg) => {
+            println!("{msg}");
+            // Start the folder's coordinator now (idempotent: stands down if one
+            // already owns it) so indexing/distillation begins immediately.
+            if let Ok(canonical) = std::fs::canonicalize(&folder) {
+                veles_mcp::spawn_coordinator_detached(
+                    &canonical.to_string_lossy(),
+                    false,
+                    (false, 0, false),
+                );
+            }
+            Ok(())
+        }
+        Err(e) => bail!("{e}"),
+    }
+}
+
 pub fn handle_status(path: String) -> Result<()> {
     let path_buf = PathBuf::from(&path);
     if !persist::index_exists(&path_buf) {
