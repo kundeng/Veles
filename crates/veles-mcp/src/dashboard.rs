@@ -102,6 +102,7 @@ async fn status(State(st): State<DashState>) -> Json<serde_json::Value> {
             .find(|status| canonical.as_ref() == Some(&status.path));
         repos.push(serde_json::json!({
             "repo": key,
+            "kind": "workspace",
             "indexed_files": stats.indexed_files,
             "total_chunks": stats.total_chunks,
             "languages": stats.languages,
@@ -111,6 +112,30 @@ async fn status(State(st): State<DashState>) -> Json<serde_json::Value> {
             }).unwrap_or("loading"),
             "watched": repo_status.is_some_and(|s| s.watching),
             "generation": veles_core::persist::current_generation(std::path::Path::new(&key)),
+        }));
+    }
+
+    // Related read-set repos are owned by *their own* coordinators and aren't in
+    // this coordinator's cache, so the loop above never sees them. Surface them
+    // from disk: resolve each to its index root (a distilled folder lives in a
+    // veles-owned shadow) and read counts straight from the committed manifest.
+    for src in crate::load_related_repos(&st.workspace) {
+        let idx_root = veles_core::ingest::index_root(std::path::Path::new(&src));
+        let (files, chunks, ready) = match veles_core::persist::load_manifest(&idx_root) {
+            Ok(m) => (m.files.len(), m.total_chunks, true),
+            Err(_) => (0, 0, false),
+        };
+        let distilled = idx_root != std::path::Path::new(&src);
+        repos.push(serde_json::json!({
+            "repo": src,
+            "kind": "related",
+            "distilled": distilled,
+            "indexed_files": files,
+            "total_chunks": chunks,
+            "languages": serde_json::json!({}),
+            "role": if ready { "reading" } else { "indexing" },
+            "watched": true,
+            "generation": veles_core::persist::current_generation(&idx_root),
         }));
     }
 
@@ -223,8 +248,14 @@ async function refresh() {
       details.textContent = `${r.indexed_files} files · ${r.total_chunks} chunks · generation ${r.generation || 'legacy'} `;
       const badge = document.createElement('span');
       badge.className = `badge ${r.watched?'on':'off'}`;
-      badge.textContent = r.watched ? 'updating' : r.role;
+      badge.textContent = r.role;
       details.appendChild(badge);
+      if (r.kind === 'related') {
+        const k = document.createElement('span');
+        k.className = 'badge'; k.style.marginLeft = '.4rem';
+        k.textContent = r.distilled ? 'related · distilled' : 'related';
+        details.appendChild(k);
+      }
       const languages = document.createElement('div');
       languages.className = 'langs'; languages.textContent = langs;
       el.append(path, details, languages);

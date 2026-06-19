@@ -1701,7 +1701,7 @@ fn related_config_mtime(workspace: &str) -> Option<std::time::SystemTime> {
 /// `<workspace>/.veles/config.toml`. Relative repo paths resolve against the
 /// workspace. An absent/unreadable/invalid config, or an unresolvable repo, is
 /// skipped (with a warning for malformed input) — never fatal.
-fn load_related_repos(workspace: &str) -> Vec<String> {
+pub(crate) fn load_related_repos(workspace: &str) -> Vec<String> {
     let ws = Path::new(workspace);
     let cfg_path = veles_core::persist::index_dir_for(ws).join("config.toml");
     let Ok(text) = std::fs::read_to_string(&cfg_path) else {
