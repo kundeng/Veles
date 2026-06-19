@@ -372,6 +372,21 @@ pub fn run_distill_folder(
 
     save_state(dest, &state)?;
 
+    // Skip the (expensive) reindex when nothing was re-derived and an index
+    // already exists. The distill coordinator re-runs this on a poll interval;
+    // a large session corpus changes rarely between ticks, and `index_dest`
+    // load+diffs the *whole* index every call. Loading a 50k+-chunk index every
+    // 10s pegged RSS (~3GB) and burned IO for no change. When the derive step
+    // touched nothing, the derived tree — and thus the index — is current, so
+    // report the committed counts from the cheap manifest and return.
+    if report.derived_written == 0 && report.derived_removed == 0 && persist::index_exists(dest) {
+        if let Ok(manifest) = persist::load_manifest(dest) {
+            report.indexed_files = manifest.files.len();
+            report.total_chunks = manifest.total_chunks;
+        }
+        return Ok(report);
+    }
+
     let stats = index_dest(dest, true, model)?;
     report.indexed_files = stats.0;
     report.total_chunks = stats.1;
@@ -573,6 +588,39 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_distill_folder_builds_then_skips_reindex_when_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("a.jsonl"),
+            "{\"message\":{\"content\":\"orbital decay\"}}\n",
+        )
+        .unwrap();
+        let dest = tmp.path().join("corpus");
+        let model = crate::model::load_model(None).expect("model");
+
+        // First run builds + indexes.
+        let r1 = run_distill_folder(&src, &dest, &model, 1000).unwrap();
+        assert_eq!(r1.derived_written, 1);
+        assert!(r1.total_chunks >= 1, "expected chunks, got {r1:?}");
+
+        // Second run, source unchanged → derive writes nothing and the reindex
+        // is skipped, but counts are still reported from the committed manifest.
+        let r2 = run_distill_folder(&src, &dest, &model, 1001).unwrap();
+        assert_eq!(
+            r2.derived_written, 0,
+            "unchanged source should not re-derive"
+        );
+        assert_eq!(r2.derived_removed, 0);
+        assert_eq!(
+            r2.total_chunks, r1.total_chunks,
+            "skip path must report chunk count from manifest"
+        );
+        assert_eq!(r2.indexed_files, r1.indexed_files);
+    }
 
     #[test]
     fn glob_base_is_literal_prefix() {
