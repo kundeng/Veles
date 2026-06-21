@@ -171,8 +171,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths", "unique_paths"],
-                        "description": "'default' returns scored, fenced code blocks with the enclosing scope. 'paths' returns just `path:start-end` per line — token-cheap shortlist for downstream processing. 'unique_paths' collapses multiple hits in the same file to a single `path` line; use it when you want a shortlist of *which files* matter, not *which chunks*."
+                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "description": "Shared with the CLI's --format. 'pretty' (default): scored, fenced code blocks with the enclosing scope. 'compact': one `path:start-end [score] snippet` line per hit. 'locations': just `path:start-end` per hit — token-cheap. 'paths' (alias 'unique_paths'): one line per unique file, best-scoring first — a shortlist of *which files* matter. 'json'/'jsonl': structured records for programmatic use."
                     }
                 },
                 "required": ["query"]
@@ -244,8 +244,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths", "unique_paths"],
-                        "description": "'default' splits into a Definitions section and a BM25 section with code blocks. 'paths' flattens both into a single `path:line` / `path:start-end` list. 'unique_paths' collapses everything to one `path` line per file."
+                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "description": "Shared with the CLI's --format. 'pretty' (default): a Definitions section and a BM25 section with code blocks. 'locations' flattens to `path:start-end` per hit; 'paths' (alias 'unique_paths') to one line per unique file; 'compact'/'json'/'jsonl' as elsewhere."
                     }
                 },
                 "required": ["name"]
@@ -317,8 +317,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths", "unique_paths"],
-                        "description": "'default' returns scored code blocks with the enclosing scope; 'paths' returns just `path:start-end` per line; 'unique_paths' collapses to one `path` per file."
+                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "description": "Shared with the CLI's --format. 'pretty' (default): scored code blocks with the enclosing scope; 'locations': `path:start-end` per hit; 'paths' (alias 'unique_paths'): one line per unique file; 'compact'/'json'/'jsonl' as elsewhere."
                     }
                 },
                 "required": ["file_path", "line"]
@@ -898,14 +898,8 @@ impl McpServer {
             if results.is_empty() {
                 return Ok(json!({"content": [{"type": "text", "text": "No results found."}]}));
             }
-            let text = match format {
-                "paths" => format_results_paths(&results),
-                "unique_paths" => format_results_unique_paths(&results),
-                _ => {
-                    let header = format!("Search results for: {query:?} (mode={mode_str})");
-                    format_results(&header, &results, Some(index.symbols()))
-                }
-            };
+            let header = format!("Search results for: {query:?} (mode={mode_str})");
+            let text = render_results(format, &header, &results, Some(index.symbols()));
             return Ok(json!({"content": [{"type": "text", "text": text}]}));
         }
 
@@ -952,17 +946,11 @@ impl McpServer {
         });
         merged.truncate(top_k);
 
-        let text = match format {
-            "paths" => format_results_paths(&merged),
-            "unique_paths" => format_results_unique_paths(&merged),
-            _ => {
-                let header = format!(
-                    "Search results for: {query:?} (mode={mode_str}, {} repos)",
-                    repos.len()
-                );
-                format_results(&header, &merged, None)
-            }
-        };
+        let header = format!(
+            "Search results for: {query:?} (mode={mode_str}, {} repos)",
+            repos.len()
+        );
+        let text = render_results(format, &header, &merged, None);
         Ok(json!({"content": [{"type": "text", "text": text}]}))
     }
 
@@ -1662,14 +1650,8 @@ impl McpServer {
             }));
         }
 
-        let text = match format {
-            "paths" => format_results_paths(&results),
-            "unique_paths" => format_results_unique_paths(&results),
-            _ => {
-                let header = format!("Chunks related to {file_path}:{line}");
-                format_results(&header, &results, Some(index.symbols()))
-            }
-        };
+        let header = format!("Chunks related to {file_path}:{line}");
+        let text = render_results(format, &header, &results, Some(index.symbols()));
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
@@ -1931,62 +1913,37 @@ fn format_symbols(header: &str, symbols: &[&Symbol]) -> String {
     lines.join("\n")
 }
 
-// Scope-label heuristic lives in `veles_core::scope` so the CLI and MCP
-// share exactly the same policy. Re-import locally for the formatter.
-use veles_core::scope::chunk_scope_label;
+/// Render results for an MCP/JSON caller through the **shared canonical
+/// renderer** (`veles_core::format`) — the single point where the MCP surface
+/// maps onto the exact same formatter the CLI uses, so the two vocabularies
+/// can never drift. Accepts every canonical format name + alias
+/// (`pretty`/`default`, `compact`, `ripgrep`, `locations`, `paths`/
+/// `unique_paths`, `json`, `jsonl`); an unknown name falls back to `pretty`.
+fn render_results(
+    format_str: &str,
+    header: &str,
+    results: &[veles_core::types::SearchResult],
+    symbols: Option<&[veles_core::symbols::Symbol]>,
+) -> String {
+    let fmt = format_str
+        .parse::<veles_core::format::OutputFormat>()
+        .unwrap_or(veles_core::format::OutputFormat::Pretty);
+    veles_core::format::render(fmt, header, results, symbols)
+}
 
-/// Format search results as numbered, fenced code blocks. When `symbols`
-/// is `Some`, each header is suffixed with a scope label (e.g.
-/// ``` defines `Manifest` ``` or ``` in `fn search_hybrid` ```).
+/// Pretty-only convenience used by the `refs` handler's BM25 section, which
+/// composes several rendered fragments by hand.
 fn format_results(
     header: &str,
     results: &[veles_core::types::SearchResult],
     symbols: Option<&[veles_core::symbols::Symbol]>,
 ) -> String {
-    let mut lines: Vec<String> = vec![header.to_string(), String::new()];
-    for (i, r) in results.iter().enumerate() {
-        let scope_suffix = symbols
-            .and_then(|syms| chunk_scope_label(syms, &r.chunk))
-            .map(|label| format!("  {label}"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "## {}. {}  [score={:.3}]{scope_suffix}",
-            i + 1,
-            r.chunk.location(),
-            r.score,
-        ));
-        lines.push("```".to_string());
-        lines.push(r.chunk.content.trim().to_string());
-        lines.push("```".to_string());
-        lines.push(String::new());
-    }
-    lines.join("\n")
-}
-
-/// Flat `path:start-end` per line — no header, no score, no chunk body.
-/// Optimised for agents that just want a shortlist of files / line ranges
-/// to act on.
-fn format_results_paths(results: &[veles_core::types::SearchResult]) -> String {
-    results
-        .iter()
-        .map(|r| r.chunk.location())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Like [`format_results_paths`] but collapses multiple hits in the same
-/// file to a single line. Order is preserved by best-scoring hit, so the
-/// most relevant file appears first. Useful when the agent wants a
-/// shortlist of *which files* to consider, not *which chunks*.
-fn format_results_unique_paths(results: &[veles_core::types::SearchResult]) -> String {
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    for r in results {
-        if seen.insert(r.chunk.file_path.as_str()) {
-            out.push(r.chunk.file_path.clone());
-        }
-    }
-    out.join("\n")
+    veles_core::format::render(
+        veles_core::format::OutputFormat::Pretty,
+        header,
+        results,
+        symbols,
+    )
 }
 
 #[cfg(test)]

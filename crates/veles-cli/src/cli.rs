@@ -29,7 +29,9 @@ Symbol-aware lookups (Rust, Python, JavaScript, TypeScript, Go):
   veles defs Manifest                # find every definition
   veles refs save_index              # defs + BM25 references
 
-Output formats: pretty (default), compact, ripgrep, paths, json, jsonl.
+Output formats (shared by the CLI and the MCP/gRPC surfaces): pretty, compact, \
+ripgrep, locations, paths, json, jsonl. `search`/`find-related` default to \
+`auto` — pretty in a terminal, compact when piped.
 Run `veles <SUBCOMMAND> --help` for per-subcommand details.")]
 #[command(version)]
 pub struct Cli {
@@ -52,8 +54,10 @@ pub enum Commands {
         /// Search mode.
         #[arg(short, long, default_value = "hybrid")]
         mode: String,
-        /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
-        #[arg(short, long, default_value = "pretty")]
+        /// Output format. Default `auto`: pretty in a terminal, compact when
+        /// piped/redirected. Other values: pretty, compact, ripgrep, locations,
+        /// paths, json, jsonl (shared with the MCP `format` arg).
+        #[arg(short, long, default_value = "auto")]
         format: String,
         /// Restrict to specific languages (comma-separated, e.g. `rust,python`).
         #[arg(short = 'l', long, value_delimiter = ',')]
@@ -67,9 +71,6 @@ pub enum Commands {
         /// Drop results scoring below this threshold.
         #[arg(long)]
         min_score: Option<f64>,
-        /// Also index non-code text files.
-        #[arg(long)]
-        include_text_files: bool,
         /// Use the multilingual embedding model (potion-multilingual-128M)
         /// instead of the default English/code-focused model. Recommended for
         /// codebases or queries containing Cyrillic, CJK, Greek, Arabic, etc.
@@ -92,8 +93,10 @@ pub enum Commands {
         /// Number of similar chunks to return.
         #[arg(short, long, default_value = "5")]
         top_k: usize,
-        /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
-        #[arg(short, long, default_value = "pretty")]
+        /// Output format. Default `auto`: pretty in a terminal, compact when
+        /// piped/redirected. Other values: pretty, compact, ripgrep, locations,
+        /// paths, json, jsonl (shared with the MCP `format` arg).
+        #[arg(short, long, default_value = "auto")]
         format: String,
         /// Restrict results to these languages (repeatable, e.g. `-l rust -l python`).
         /// Overrides the default of "same language as the source chunk".
@@ -108,9 +111,6 @@ pub enum Commands {
         /// Drop results scoring below this threshold.
         #[arg(long)]
         min_score: Option<f64>,
-        /// Also index non-code text files.
-        #[arg(long)]
-        include_text_files: bool,
         /// Use the multilingual embedding model.
         #[arg(long)]
         multilingual: bool,

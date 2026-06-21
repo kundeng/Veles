@@ -77,3 +77,22 @@ pub fn parse_format(s: &str) -> Result<crate::format::OutputFormat> {
     s.parse::<crate::format::OutputFormat>()
         .map_err(|e| anyhow::anyhow!(e))
 }
+
+/// Resolve a `--format` value, treating the sentinel `"auto"` as
+/// TTY-dependent: `pretty` when stdout is a terminal (a human is reading),
+/// `compact` when piped or redirected (a script or agent is parsing). This is
+/// the one knob that serves both audiences without a flag — humans get
+/// readable output, pipelines get a stable greppable line per hit. Any other
+/// value parses normally.
+pub fn resolve_format(s: &str) -> Result<crate::format::OutputFormat> {
+    use crate::format::OutputFormat;
+    use std::io::IsTerminal;
+    if s == "auto" {
+        return Ok(if std::io::stdout().is_terminal() {
+            OutputFormat::Pretty
+        } else {
+            OutputFormat::Compact
+        });
+    }
+    parse_format(s)
+}

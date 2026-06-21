@@ -100,6 +100,7 @@ pub mod cache;
 pub mod chunker;
 pub mod distill;
 pub mod filter;
+pub mod format;
 pub mod index;
 pub mod ingest;
 pub mod lease;

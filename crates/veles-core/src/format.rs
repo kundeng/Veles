@@ -4,26 +4,33 @@
 //! `pretty` is the human-friendly default; everything else is pipe-friendly
 //! (no decorative header, stable per-line layout).
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use serde::Serialize;
-use veles_core::scope::chunk_scope_label;
-use veles_core::symbols::Symbol;
-use veles_core::types::SearchResult;
+use crate::scope::chunk_scope_label;
+use crate::symbols::Symbol;
+use crate::types::SearchResult;
 
 /// Output format for `search` and `find-related`.
+///
+/// This is the single, canonical format taxonomy shared by every surface
+/// (CLI `--format`, MCP `format`, gRPC). Add a format here and both the
+/// terminal and the agent-facing tools gain it at once — they can never
+/// drift into separate vocabularies again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Human-friendly markdown with fenced code blocks (default).
+    /// Human-friendly markdown with fenced code blocks (default in a terminal).
     Pretty,
-    /// `path:start-end  [score=X.XXX]  <first non-blank line>` — one line per result.
+    /// `path:start-end  [score=X.XXX]  <first non-blank line>` — one line per hit.
     Compact,
     /// Ripgrep-style: every source line as `path:lineno:content`.
     Ripgrep,
-    /// Just unique paths, one per line, sorted.
+    /// `path:start-end` per hit — locations only, no score/snippet/body.
+    Locations,
+    /// Unique file paths, one per line, best-scoring file first.
     Paths,
-    /// Single JSON object: `{"results": [...]}`.
+    /// Single JSON object: `{"results": [...]}` (default when piped/non-TTY).
     Json,
     /// JSON Lines: one result object per line.
     Jsonl,
@@ -32,15 +39,19 @@ pub enum OutputFormat {
 impl FromStr for OutputFormat {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Accept both kebab- and snake-case for multi-word names so the CLI
+        // and MCP/JSON callers can use whichever their ecosystem prefers.
         match s {
             "pretty" | "default" | "md" | "markdown" => Ok(Self::Pretty),
             "compact" => Ok(Self::Compact),
             "ripgrep" | "rg" => Ok(Self::Ripgrep),
-            "paths" | "files" => Ok(Self::Paths),
+            "locations" | "hits" => Ok(Self::Locations),
+            "paths" | "files" | "unique-paths" | "unique_paths" => Ok(Self::Paths),
             "json" => Ok(Self::Json),
             "jsonl" | "ndjson" => Ok(Self::Jsonl),
             other => Err(format!(
-                "unknown format {other:?} (try: pretty, compact, ripgrep, paths, json, jsonl)"
+                "unknown format {other:?} (try: pretty, compact, ripgrep, \
+                 locations, paths, json, jsonl)"
             )),
         }
     }
@@ -61,6 +72,7 @@ pub fn render(
         OutputFormat::Pretty => render_pretty(header, results, symbols),
         OutputFormat::Compact => render_compact(results, symbols),
         OutputFormat::Ripgrep => render_ripgrep(results),
+        OutputFormat::Locations => render_locations(results),
         OutputFormat::Paths => render_paths(results),
         OutputFormat::Json => render_json(header, results, false),
         OutputFormat::Jsonl => render_json(header, results, true),
@@ -73,7 +85,7 @@ pub fn empty_message(format: OutputFormat, what: &str) -> String {
         OutputFormat::Pretty | OutputFormat::Compact | OutputFormat::Ripgrep => {
             format!("No {what} found.")
         }
-        OutputFormat::Paths => String::new(),
+        OutputFormat::Locations | OutputFormat::Paths => String::new(),
         OutputFormat::Json => "{\"results\":[]}".to_string(),
         OutputFormat::Jsonl => String::new(),
     }
@@ -128,9 +140,20 @@ fn render_ripgrep(results: &[SearchResult]) -> String {
     out
 }
 
+/// `path:start-end` per hit — locations only, in result (best-first) order.
+fn render_locations(results: &[SearchResult]) -> String {
+    let mut out = String::new();
+    for r in results {
+        out.push_str(&r.chunk.location());
+        out.push('\n');
+    }
+    out
+}
+
 fn render_paths(results: &[SearchResult]) -> String {
-    // Unique paths, sorted, in result order otherwise.
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    // Unique file paths, in result order — best-scoring file first (relevance
+    // is more useful than alphabetical for both humans and agents).
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut out = String::new();
     for r in results {
         if seen.insert(r.chunk.file_path.as_str()) {
@@ -197,7 +220,9 @@ fn render_json(header: &str, results: &[SearchResult], lines: bool) -> String {
 pub fn render_symbols(format: OutputFormat, header: &str, symbols: &[&Symbol]) -> String {
     match format {
         OutputFormat::Pretty => render_symbols_pretty(header, symbols),
-        OutputFormat::Compact | OutputFormat::Ripgrep => render_symbols_compact(symbols),
+        OutputFormat::Compact | OutputFormat::Ripgrep | OutputFormat::Locations => {
+            render_symbols_compact(symbols)
+        }
         OutputFormat::Paths => render_symbols_paths(symbols),
         OutputFormat::Json => render_symbols_json(header, symbols, false),
         OutputFormat::Jsonl => render_symbols_json(header, symbols, true),
@@ -233,7 +258,7 @@ fn render_symbols_compact(symbols: &[&Symbol]) -> String {
 }
 
 fn render_symbols_paths(symbols: &[&Symbol]) -> String {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut out = String::new();
     for s in symbols {
         if seen.insert(s.file_path.as_str()) {
@@ -305,7 +330,7 @@ fn first_nonblank_line(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veles_core::types::{Chunk, SearchMode};
+    use crate::types::{Chunk, SearchMode};
 
     fn r(path: &str, start: usize, end: usize, score: f64, content: &str) -> SearchResult {
         SearchResult {
@@ -379,9 +404,34 @@ mod tests {
         assert_eq!("rg".parse::<OutputFormat>().unwrap(), OutputFormat::Ripgrep);
         assert_eq!("md".parse::<OutputFormat>().unwrap(), OutputFormat::Pretty);
         assert_eq!(
+            "default".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Pretty
+        );
+        assert_eq!(
             "ndjson".parse::<OutputFormat>().unwrap(),
             OutputFormat::Jsonl
         );
+        // `paths` and its MCP alias `unique_paths` are the same canonical format.
+        assert_eq!("paths".parse::<OutputFormat>().unwrap(), OutputFormat::Paths);
+        assert_eq!(
+            "unique_paths".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Paths
+        );
+        assert_eq!(
+            "unique-paths".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Paths
+        );
+        assert_eq!(
+            "locations".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Locations
+        );
         assert!("xml".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn locations_emit_path_ranges_per_hit() {
+        let results = vec![r("a.rs", 1, 5, 0.9, "x"), r("a.rs", 6, 10, 0.8, "y")];
+        let out = render(OutputFormat::Locations, "h", &results, None);
+        assert_eq!(out, "a.rs:1-5\na.rs:6-10\n");
     }
 }

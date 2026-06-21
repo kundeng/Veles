@@ -20,7 +20,7 @@ use veles_core::types::{SearchMode, SearchResult};
 use crate::cli::Cli;
 use crate::format::{self, OutputFormat};
 use crate::output::{emit_results, emit_symbols};
-use crate::util::{load_model, open_index, parse_format, resolve_path_filter};
+use crate::util::{load_model, open_index, parse_format, resolve_format, resolve_path_filter};
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_search(
@@ -33,12 +33,15 @@ pub fn handle_search(
     path_glob: Vec<String>,
     exclude_glob: Vec<String>,
     min_score: Option<f64>,
-    include_text_files: bool,
     multilingual: bool,
     no_cache: bool,
 ) -> Result<()> {
-    let format = parse_format(&format_str)?;
-    let index = open_index(&path, multilingual, include_text_files, !no_cache)?;
+    let format = resolve_format(&format_str)?;
+    // Index contents (code-only vs +text) are an index-time decision owned by
+    // `index`/`add`; search just reads whatever the persisted index holds. A
+    // fresh build here is code-only by design — there is no per-query
+    // `--include-text-files` footgun anymore.
+    let index = open_index(&path, multilingual, false, !no_cache)?;
     let search_mode = mode.parse::<SearchMode>().unwrap_or(SearchMode::Hybrid);
 
     let glob_paths = resolve_path_filter(&index, &path_glob, &exclude_glob)?;
@@ -72,12 +75,11 @@ pub fn handle_find_related(
     path_glob: Vec<String>,
     exclude_glob: Vec<String>,
     min_score: Option<f64>,
-    include_text_files: bool,
     multilingual: bool,
     no_cache: bool,
 ) -> Result<()> {
-    let format = parse_format(&format_str)?;
-    let index = open_index(&path, multilingual, include_text_files, !no_cache)?;
+    let format = resolve_format(&format_str)?;
+    let index = open_index(&path, multilingual, false, !no_cache)?;
 
     let chunk = match index.resolve_chunk(&file_path, line) {
         Some(c) => c.clone(),

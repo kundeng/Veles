@@ -8,10 +8,14 @@
 //! - `handlers` — one `handle_*` function per subcommand
 //! - `output`   — stdout sinks for rendered formatter output
 //! - `util`     — index/model loaders and glob-filter helpers
-//! - `format`   — pure formatter renderers (no I/O)
+//! - `format`   — re-export of the shared `veles-core` renderer so the CLI and
+//!   the MCP/gRPC surfaces speak one format vocabulary
 
 mod cli;
-mod format;
+/// Shared, canonical output-format taxonomy — defined once in `veles-core`
+/// and reused by every surface so the CLI and agent-facing tools can never
+/// drift into separate format vocabularies.
+pub use veles_core::format;
 mod handlers;
 mod output;
 mod tui;
@@ -46,7 +50,6 @@ async fn main() -> Result<()> {
             path_glob,
             exclude_glob,
             min_score,
-            include_text_files,
             multilingual,
             no_cache,
         }) => handlers::handle_search(
@@ -59,7 +62,6 @@ async fn main() -> Result<()> {
             path_glob,
             exclude_glob,
             min_score,
-            include_text_files,
             multilingual,
             no_cache,
         ),
@@ -74,7 +76,6 @@ async fn main() -> Result<()> {
             path_glob,
             exclude_glob,
             min_score,
-            include_text_files,
             multilingual,
             no_cache,
         }) => handlers::handle_find_related(
@@ -87,7 +88,6 @@ async fn main() -> Result<()> {
             path_glob,
             exclude_glob,
             min_score,
-            include_text_files,
             multilingual,
             no_cache,
         ),
