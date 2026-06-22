@@ -32,6 +32,9 @@ Symbol-aware lookups (Rust, Python, JavaScript, TypeScript, Go):
 Output formats (shared by the CLI and the MCP/gRPC surfaces): pretty, compact, \
 ripgrep, locations, paths, json, jsonl. `search`/`find-related` default to \
 `auto` — pretty in a terminal, compact when piped.
+
+Exit codes: 0 ok · 1 error · 2 usage · 3 not found. `index`/`update`/`add` and \
+searches are idempotent — safe to re-run.
 Run `veles <SUBCOMMAND> --help` for per-subcommand details.")]
 #[command(version)]
 pub struct Cli {

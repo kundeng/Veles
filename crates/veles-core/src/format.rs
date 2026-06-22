@@ -57,6 +57,19 @@ impl FromStr for OutputFormat {
     }
 }
 
+/// Canonical format names advertised to schema-driven callers (the MCP/gRPC
+/// tool definitions). This is the **single source** the MCP `format` enum is
+/// built from — adding a format here (and to [`OutputFormat`]/[`FromStr`])
+/// updates every surface at once, so the CLI and the agent tools can't drift
+/// into separate vocabularies. Includes the `unique_paths` alias because the
+/// agent-facing docs reference it. The `advertised_names_all_parse` test
+/// guarantees every entry here is a real, parseable format.
+pub fn advertised_format_names() -> &'static [&'static str] {
+    &[
+        "pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl",
+    ]
+}
+
 /// Render results in the requested format.
 ///
 /// `symbols`, when supplied, enriches the `pretty` and `compact` headers
@@ -426,6 +439,19 @@ mod tests {
             OutputFormat::Locations
         );
         assert!("xml".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn advertised_names_all_parse() {
+        // The MCP schema's `format` enum is built from this list — every entry
+        // must be a real, parseable format or the agent surface would advertise
+        // a value the renderer rejects.
+        for name in advertised_format_names() {
+            assert!(
+                name.parse::<OutputFormat>().is_ok(),
+                "advertised format {name:?} does not parse"
+            );
+        }
     }
 
     #[test]

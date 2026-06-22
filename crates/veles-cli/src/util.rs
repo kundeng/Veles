@@ -5,6 +5,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+/// A "ran fine, but the requested thing does not exist" error — maps to exit
+/// code 3 (see `main::exit_code_for`), distinct from a generic failure (1) or a
+/// usage error (2, from clap). Lets a script or agent branch on *not found* vs
+/// *broke*. Return it (don't `process::exit`) so callers control the flow.
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 use veles_core::VelesIndex;
 use veles_core::filter;
 use veles_core::model;

@@ -84,8 +84,7 @@ pub fn handle_find_related(
     let chunk = match index.resolve_chunk(&file_path, line) {
         Some(c) => c.clone(),
         None => {
-            eprintln!("No chunk found at {file_path}:{line}.");
-            std::process::exit(1);
+            return Err(crate::util::NotFound(format!("no chunk at {file_path}:{line}")).into());
         }
     };
 

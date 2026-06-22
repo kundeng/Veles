@@ -26,8 +26,22 @@ use clap::Parser;
 
 use crate::cli::{Cli, Commands};
 
+/// Stable process exit codes — documented so scripts and agents can branch on
+/// *why* a run ended, not just success vs failure:
+///   0  success
+///   1  runtime error (I/O, index, internal)
+///   2  usage error (bad flags/args — emitted by clap before we run)
+///   3  not found (a requested location / symbol / chunk does not exist)
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<crate::util::NotFound>().is_some() {
+        3
+    } else {
+        1
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Initialize logging (to stderr so it doesn't interfere with MCP stdio).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -39,7 +53,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    let result: Result<()> = match cli.command {
         Some(Commands::Search {
             query,
             path,
@@ -190,5 +204,10 @@ async fn main() -> Result<()> {
         }
 
         None => handlers::handle_default().await,
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {e:#}");
+        std::process::exit(exit_code_for(&e));
     }
 }

@@ -171,7 +171,7 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "enum": veles_core::format::advertised_format_names(),
                         "description": "Shared with the CLI's --format. 'pretty' (default): scored, fenced code blocks with the enclosing scope. 'compact': one `path:start-end [score] snippet` line per hit. 'locations': just `path:start-end` per hit — token-cheap. 'paths' (alias 'unique_paths'): one line per unique file, best-scoring first — a shortlist of *which files* matter. 'json'/'jsonl': structured records for programmatic use."
                     }
                 },
@@ -244,7 +244,7 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "enum": veles_core::format::advertised_format_names(),
                         "description": "Shared with the CLI's --format. 'pretty' (default): a Definitions section and a BM25 section with code blocks. 'locations' flattens to `path:start-end` per hit; 'paths' (alias 'unique_paths') to one line per unique file; 'compact'/'json'/'jsonl' as elsewhere."
                     }
                 },
@@ -317,7 +317,7 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["pretty", "compact", "ripgrep", "locations", "paths", "unique_paths", "json", "jsonl"],
+                        "enum": veles_core::format::advertised_format_names(),
                         "description": "Shared with the CLI's --format. 'pretty' (default): scored code blocks with the enclosing scope; 'locations': `path:start-end` per hit; 'paths' (alias 'unique_paths'): one line per unique file; 'compact'/'json'/'jsonl' as elsewhere."
                     }
                 },
