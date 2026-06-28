@@ -32,3 +32,8 @@ unicode-width = "0.2"
 [features]
 # Compile in the optional per-repo web dashboard (`serve-mcp --dashboard`).
 dashboard = ["veles-mcp/dashboard"]
+# Compile in the optional transformer reranker (`search --rerank`). Pulls candle
+# into both the core and the MCP transport so the flag works on every surface.
+rerank = ["veles-core/rerank", "veles-mcp/rerank"]
+# As `rerank`, but with CUDA kernels for auto-GPU.
+cuda = ["veles-core/cuda", "veles-mcp/cuda"]

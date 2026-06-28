@@ -66,6 +66,8 @@ async fn main() {
             min_score,
             multilingual,
             no_cache,
+            rerank,
+            rerank_k,
         }) => handlers::handle_search(
             query,
             path,
@@ -78,6 +80,8 @@ async fn main() {
             min_score,
             multilingual,
             no_cache,
+            rerank,
+            rerank_k,
         ),
 
         Some(Commands::FindRelated {

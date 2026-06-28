@@ -82,6 +82,15 @@ pub enum Commands {
         /// Force a fresh in-memory build, ignoring any `.veles/` cache.
         #[arg(long)]
         no_cache: bool,
+        /// Re-rank the recall set with a transformer (bge-small-en-v1.5) for a
+        /// precision boost. Requires a build with `--features rerank`; auto-uses
+        /// the GPU when present.
+        #[arg(long)]
+        rerank: bool,
+        /// Recall depth feeding the reranker (how many candidates the cheap
+        /// stage pulls before re-scoring). Only used with `--rerank`.
+        #[arg(long, default_value = "50")]
+        rerank_k: usize,
     },
 
     /// Find code similar to a specific location.

@@ -109,6 +109,9 @@ pub mod model;
 pub mod persist;
 pub mod pipeline;
 pub mod ranking;
+/// Optional transformer reranker — only built with `--features rerank`.
+#[cfg(feature = "rerank")]
+pub mod rerank;
 pub mod runtime;
 pub mod scope;
 pub mod symbols;

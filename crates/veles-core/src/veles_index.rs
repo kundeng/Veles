@@ -513,6 +513,59 @@ impl VelesIndex {
         }
     }
 
+    /// Two-stage search: cheap recall (this index) → transformer rerank.
+    ///
+    /// Stage 1 runs the normal [`search`](Self::search) to pull `k_recall`
+    /// candidates (a wider net than we return). Stage 2 re-scores just those
+    /// candidates with `reranker` (a BERT bi-encoder) and returns the `top_k`
+    /// best by transformer cosine.
+    ///
+    /// This is the **single core entry** both the CLI (`--rerank`) and the MCP
+    /// server (`rerank` arg) call — there is no surface-specific search logic.
+    /// A `None` reranker degrades to plain `search` truncated to `top_k`, so the
+    /// flag can be threaded through unconditionally.
+    #[cfg(feature = "rerank")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_rerank(
+        &self,
+        query: &str,
+        top_k: usize,
+        k_recall: usize,
+        mode: SearchMode,
+        alpha: Option<f64>,
+        filter_languages: Option<&[String]>,
+        filter_paths: Option<&[String]>,
+        reranker: Option<&crate::rerank::Reranker>,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        // Recall stage: never pull fewer than we intend to return.
+        let recall = k_recall.max(top_k);
+        let mut results =
+            self.search(query, recall, mode, alpha, filter_languages, filter_paths);
+
+        let Some(reranker) = reranker else {
+            // No transformer → identical to `search`, just bounded to top_k.
+            results.truncate(top_k);
+            return Ok(results);
+        };
+        if results.is_empty() {
+            return Ok(results);
+        }
+
+        // Stage 2: re-score the recall set by transformer cosine and reorder.
+        let candidates: Vec<String> = results.iter().map(|r| r.chunk.content.clone()).collect();
+        let scores = reranker.rerank(query, &candidates)?;
+        for (r, s) in results.iter_mut().zip(scores.iter()) {
+            r.score = *s as f64; // score now means "rerank cosine"
+        }
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+        Ok(results)
+    }
+
     /// Return chunks semantically similar to the given chunk.
     ///
     /// When neither `filter_languages` nor `filter_paths` is supplied, the

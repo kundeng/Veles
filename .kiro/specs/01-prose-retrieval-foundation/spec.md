@@ -158,16 +158,19 @@ records + BM25/static recall + transformer rerank.
 - [x] 1.2 **Architecture benchmarked (D5)** — two-stage rerank K=50 = 599ms CPU; clean records +43% P@5.
   Chosen: BM25/static recall → transformer rerank top-K. Backend = **candle** (pure Rust, single-binary,
   auto-GPU) not ort/onnxruntime (the ck portability trap). Recorded D5/D6/D8.
-- [ ] 1.3 **candle reranker — bolt-on, single core path.** Sub-tasks:
-  - [ ] 1.3a Add candle-core/nn/transformers + tokenizers + hf-hub to veles-core behind a `rerank`
-    cargo feature; load **bge-small-en-v1.5** (BERT) + tokenizer via hf-hub; `Device::cuda_if_available`.
-    Smoke: embed one string → 384-dim L2-normed vector. Default build (no feature) unchanged.
-  - [ ] 1.3b `Reranker::rerank(query, candidates: &[text]) -> Vec<f32>` (mean-pool + cosine). Unit test
-    on a tiny fixture (relevant doc outranks distractor).
-  - [ ] 1.3c **One** core fn `search_with_rerank(index, query, k_recall, rerank: Option<&Reranker>)`
-    in veles-core: hybrid recall top-`k_recall`, then reorder by reranker if present. Reuse `VelesIndex::search`.
-- [ ] 1.4 **Wire CLI + MCP to the same core fn (no dual path).** CLI `--rerank` flag → `search_with_rerank`;
-  MCP `search` gains a `rerank` arg → the **same** fn. Default off; feature-gated.
+- [x] 1.3 **candle reranker — bolt-on, single core path.** Sub-tasks:
+  - [x] 1.3a candle-core/nn/transformers + tokenizers + hf-hub added to veles-core behind a `rerank`
+    cargo feature; `rerank.rs` loads **bge-small-en-v1.5** (BERT) + tokenizer via hf-hub;
+    `Device::cuda_if_available`. Smoke test `embed_smoke` asserts a 384-dim unit-norm vector.
+    Default build (no feature) verified candle-free (`cargo clippy --workspace`, 9.7s, no candle compiles).
+  - [x] 1.3b `Reranker::rerank(query, &[candidate]) -> Vec<f32>` (masked mean-pool + cosine via one
+    batched forward + matmul). Unit test `rerank_orders_by_relevance` (on-topic outranks distractor).
+  - [x] 1.3c **One** core fn `VelesIndex::search_with_rerank(query, top_k, k_recall, mode, …, reranker:
+    Option<&Reranker>)` in veles-core: reuses `search` for recall top-`k_recall`, reorders by reranker
+    if present, else degrades to plain `search` truncated to `top_k`.
+- [x] 1.4 **Wire CLI + MCP to the same core fn (no dual path).** CLI `--rerank`/`--rerank-k` → the core
+  fn (handlers.rs); MCP `search` gained a `rerank` arg → the **same** fn (single + multi-repo paths).
+  Default off; feature-gated; `--features rerank` (and `cuda`) plumbed through veles-cli → core + mcp.
 
 - [x] 1.5 **Structured-record cleaner built + wired (the +43% lever).** `pipelines/session_distill.py`
   (external transform per D7) + `pipelines/veles.pipeline.json`. Keeps user/assistant prose, brief
@@ -177,12 +180,27 @@ records + BM25/static recall + transformer rerank.
   stays format-blind. Static scores stay ~0.009 (expected — needs the transformer to realize the gain).
 
 ### P2 — Should Do
-- [ ] 2.1 Verify: the 3 prose queries + 2 code queries return on-topic top hits via the shipped path
-  (this is the verification task — system-level, not unit).
+- [x] 2.1 **Verified e2e on the clean 229-session corpus** via the shipped `veles search --rerank`
+  path (release binary, `--features rerank`). 3 prose queries return on-topic top hits and the
+  transformer **visibly reorders** the static recall set (e.g. "UI said approved but nothing happened"
+  promoted `splunk-agentic-workbench/4ba73eca…` to #1; "veles distill jsonl…" surfaced two
+  `bayeslearner-skills` veles/distill chunks). Unit tests `embed_smoke` (384-dim unit vector) +
+  `rerank_orders_by_relevance` pass. Default build verified candle-free.
+  **Latency finding (corrects 1.2's 599ms):** the candle pure-Rust **f32 CPU** path costs
+  **k=10 → 8.2 s, k=50 → 36 s** per query on 16 cores (≈0.7 s/candidate at ~512 tokens, ~1 GB RSS,
+  linear in k). The 599 ms in 1.2 was a Python/onnx measurement, not this engine. **CPU rerank is
+  impractical → confirms D5/D6: transformer rerank is a GPU-only accelerator; static/BM25 is the CPU floor.**
 - [ ] 2.2 Document install + usage (README/quick-start) for the chosen engine path.
+- [ ] 2.3 **Enable the GPU rerank path.** Code is wired (`Device::cuda_if_available`, `--features cuda`),
+  but this box has the GPU (RTX 5070 Ti, 16 GB) **without the CUDA toolkit** (no `nvcc`/`libcudart`),
+  so `--features cuda` can't compile candle kernels. Blackwell (sm_120) needs CUDA **12.8+** — the
+  distro `nvidia-cuda-toolkit` is too old. Install the matching toolkit, then `cargo build
+  --features cuda` and re-measure (expect <100 ms for the same 1.7 TFLOP). Owner action (sudo).
 
 ### P3 — Nice to Have
 - [ ] 3.1 nomic-embed-text vs bge-small comparison for long (8k-ctx) chunks on this corpus.
+- [ ] 3.2 If CPU rerank must be usable without a GPU: candle BLAS (`mkl`/`accelerate`) or int8 quant —
+  weigh against the single-binary/no-external-dep portability goal (the reason candle beat onnxruntime).
 
 ## Open Questions
 - [ ] If adopt-ck: does the project repo become "distill/memory layer over ck" (rename/reorg from the
@@ -207,4 +225,12 @@ elevates the structured-distill layer (→ spec 02) to the top quality priority;
 architecture (two-stage rerank, GPU-optional) is sound but gated on clean records to actually shine.
 (Validation run also had a sampling artifact — sequential fill let one giant session dominate the
 2500-chunk slice; not corpus-representative, but the noise-ceiling conclusion holds.)
+**2026-06-28** — candle reranker **built, wired, and verified e2e** (tasks 1.3a/b/c, 1.4, 2.1).
+`crates/veles-core/src/rerank.rs`: `Reranker` loads bge-small-en-v1.5 (BERT, 384-dim) via hf-hub,
+masked mean-pool + cosine, `cuda_if_available`, tokenizer truncated to 512 (BERT position cap — the
+one runtime bug found + fixed). Single core fn `VelesIndex::search_with_rerank` (recall→rerank, reuses
+`search`); CLI `--rerank`/`--rerank-k` and MCP `rerank` arg both call it — no dual path. All behind a
+`rerank` cargo feature; default build stays candle-free (clippy 9.7 s, no candle compiles). **Honest
+latency:** candle f32 **CPU** = k=50 → **36 s/query** (not 1.2's 599 ms, which was Python/onnx) →
+confirms transformer rerank is GPU-only in practice. GPU build blocked on missing CUDA toolkit (→ 2.3).
 </content>

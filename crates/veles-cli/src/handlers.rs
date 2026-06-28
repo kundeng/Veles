@@ -35,6 +35,8 @@ pub fn handle_search(
     min_score: Option<f64>,
     multilingual: bool,
     no_cache: bool,
+    rerank: bool,
+    rerank_k: usize,
 ) -> Result<()> {
     let format = resolve_format(&format_str)?;
     // Index contents (code-only vs +text) are an index-time decision owned by
@@ -48,7 +50,40 @@ pub fn handle_search(
     let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
     let path_slice: Option<&[String]> = glob_paths.as_deref();
 
-    let mut results = index.search(&query, top_k, search_mode, None, lang_slice, path_slice);
+    // Both branches yield the same `Vec<SearchResult>` — the rerank branch just
+    // routes through the two-stage core fn. The `#[cfg]` is a thin compile gate,
+    // not a second search implementation.
+    let mut results = if rerank {
+        #[cfg(feature = "rerank")]
+        {
+            let reranker = veles_core::rerank::Reranker::load(None)
+                .context("load transformer reranker (bge-small-en-v1.5)")?;
+            eprintln!(
+                "rerank: bge-small-en-v1.5 on {} (recall k={rerank_k})",
+                if reranker.on_gpu() { "GPU" } else { "CPU" }
+            );
+            index.search_with_rerank(
+                &query,
+                top_k,
+                rerank_k,
+                search_mode,
+                None,
+                lang_slice,
+                path_slice,
+                Some(&reranker),
+            )?
+        }
+        #[cfg(not(feature = "rerank"))]
+        {
+            let _ = rerank_k;
+            bail!(
+                "this `veles` was built without rerank support — rebuild with \
+                 `cargo build --features rerank` (or `--features cuda` for GPU)"
+            );
+        }
+    } else {
+        index.search(&query, top_k, search_mode, None, lang_slice, path_slice)
+    };
 
     if let Some(threshold) = min_score {
         results.retain(|r| r.score >= threshold);

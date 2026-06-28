@@ -169,6 +169,11 @@ fn tools() -> Vec<Tool> {
                         "type": "number",
                         "description": "Drop results whose score is below this threshold."
                     },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Re-rank the recall set with a transformer (bge-small-en-v1.5) for higher precision on fuzzy natural-language queries. Slower (loads a model; ~0.6s on CPU). Requires a veles build with the `rerank` feature; ignored otherwise.",
+                        "default": false
+                    },
                     "format": {
                         "type": "string",
                         "enum": veles_core::format::advertised_format_names(),
@@ -878,6 +883,28 @@ impl McpServer {
         let format = args["format"].as_str().unwrap_or("default");
         let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
 
+        // Optional transformer rerank (same core fn the CLI uses). Loaded once
+        // per request and shared across repos in the multi-repo read-set.
+        let rerank = args["rerank"].as_bool().unwrap_or(false);
+        #[cfg(feature = "rerank")]
+        let reranker = if rerank {
+            Some(
+                veles_core::rerank::Reranker::load(None).map_err(|e| JsonRpcError {
+                    code: -32000,
+                    message: format!("load reranker: {e}"),
+                })?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "rerank"))]
+        if rerank {
+            self.emit(
+                "rerank requested but this veles build lacks the `rerank` feature; ignoring"
+                    .to_string(),
+            );
+        }
+
         // Single-repo path: unchanged, and keeps tree-sitter scope labels.
         if repos.len() == 1 {
             let index_arc = self.load_repo(&repos[0]).await.map_err(|e| JsonRpcError {
@@ -890,6 +917,23 @@ impl McpServer {
                     code: -32000,
                     message: e.to_string(),
                 })?;
+            #[cfg(feature = "rerank")]
+            let mut results = index
+                .search_with_rerank(
+                    query,
+                    top_k,
+                    veles_core::rerank::DEFAULT_RERANK_RECALL,
+                    mode,
+                    None,
+                    lang_slice,
+                    glob_paths.as_deref(),
+                    reranker.as_ref(),
+                )
+                .map_err(|e| JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                })?;
+            #[cfg(not(feature = "rerank"))]
             let mut results =
                 index.search(query, top_k, mode, None, lang_slice, glob_paths.as_deref());
             if let Some(threshold) = min_score {
@@ -924,6 +968,23 @@ impl McpServer {
                     continue;
                 }
             };
+            #[cfg(feature = "rerank")]
+            let mut results = index
+                .search_with_rerank(
+                    query,
+                    top_k,
+                    veles_core::rerank::DEFAULT_RERANK_RECALL,
+                    mode,
+                    None,
+                    lang_slice,
+                    glob_paths.as_deref(),
+                    reranker.as_ref(),
+                )
+                .map_err(|e| JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                })?;
+            #[cfg(not(feature = "rerank"))]
             let mut results =
                 index.search(query, top_k, mode, None, lang_slice, glob_paths.as_deref());
             if let Some(threshold) = min_score {
