@@ -1,0 +1,16 @@
+{
+  "stages": [
+    {
+      "name": "agent-sessions",
+      "dest": "~/.local/state/veles/corpora/sessions",
+      "include_text_files": true,
+      "inputs": [
+        {
+          "name": "claude",
+          "source": "~/.claude/projects/**/*.jsonl",
+          "transform": ["python3", "session_distill.py"]
+        }
+      ]
+    }
+  ]
+}
