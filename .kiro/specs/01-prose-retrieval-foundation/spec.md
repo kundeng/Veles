@@ -155,15 +155,19 @@ records + BM25/static recall + transformer rerank.
 - [x] 1.1 **Engine bake-off — ck eliminated, extend veles.** Resolved by elimination (D1): ck is slow
   at indexing (owner), shares fastembed's ~13 chunks/s bottleneck (no advantage), and won't run on
   this box (GLIBC 2.35 < 2.38; source build fails). Evidence recorded in D1.
-- [ ] 1.2 **Benchmark the speed-vs-quality architectures (D5)** — measure, on the distilled corpus:
-  (a) two-stage BM25/static recall → transformer rerank top-K (query-time cost for K=20/50);
-  (b) int8-quantized bge-small index throughput vs fp32 (the 13 chunks/s baseline). Pick the
-  architecture in D5 from numbers. **This is the gating task — do before building.**
-- [ ] 1.3 **Implement the chosen architecture in veles.** Likely: `Embedder` enum {Static|Onnx}
-  fastembed backend used as a **reranker over top-K** (not a full-corpus index), preserving the fast
-  BM25/static index and the lexical RRF channel.
-- [ ] 1.4 **CLI + MCP prose search** end-to-end on the corpus, daemon-free from the CLI; per-corpus
-  model choice recorded in the index manifest.
+- [x] 1.2 **Architecture benchmarked (D5)** — two-stage rerank K=50 = 599ms CPU; clean records +43% P@5.
+  Chosen: BM25/static recall → transformer rerank top-K. Backend = **candle** (pure Rust, single-binary,
+  auto-GPU) not ort/onnxruntime (the ck portability trap). Recorded D5/D6/D8.
+- [ ] 1.3 **candle reranker — bolt-on, single core path.** Sub-tasks:
+  - [ ] 1.3a Add candle-core/nn/transformers + tokenizers + hf-hub to veles-core behind a `rerank`
+    cargo feature; load **bge-small-en-v1.5** (BERT) + tokenizer via hf-hub; `Device::cuda_if_available`.
+    Smoke: embed one string → 384-dim L2-normed vector. Default build (no feature) unchanged.
+  - [ ] 1.3b `Reranker::rerank(query, candidates: &[text]) -> Vec<f32>` (mean-pool + cosine). Unit test
+    on a tiny fixture (relevant doc outranks distractor).
+  - [ ] 1.3c **One** core fn `search_with_rerank(index, query, k_recall, rerank: Option<&Reranker>)`
+    in veles-core: hybrid recall top-`k_recall`, then reorder by reranker if present. Reuse `VelesIndex::search`.
+- [ ] 1.4 **Wire CLI + MCP to the same core fn (no dual path).** CLI `--rerank` flag → `search_with_rerank`;
+  MCP `search` gains a `rerank` arg → the **same** fn. Default off; feature-gated.
 
 - [x] 1.5 **Structured-record cleaner built + wired (the +43% lever).** `pipelines/session_distill.py`
   (external transform per D7) + `pipelines/veles.pipeline.json`. Keeps user/assistant prose, brief
