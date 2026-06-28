@@ -165,6 +165,13 @@ records + BM25/static recall + transformer rerank.
 - [ ] 1.4 **CLI + MCP prose search** end-to-end on the corpus, daemon-free from the CLI; per-corpus
   model choice recorded in the index manifest.
 
+- [x] 1.5 **Structured-record cleaner built + wired (the +43% lever).** `pipelines/session_distill.py`
+  (external transform per D7) + `pipelines/veles.pipeline.json`. Keeps user/assistant prose, brief
+  thinking, tool_result ERRORS; drops snapshots/hooks/last-prompt/ai-title/queue-ops/tool-params/
+  successful-dumps/scaffolding; truncates + dedupes. **Validated end-to-end:** `veles transform`
+  distilled 229 sessions → 28 MB clean index / 2737 chunks in **8.7 s** (vs noisy 720 MB). veles
+  stays format-blind. Static scores stay ~0.009 (expected — needs the transformer to realize the gain).
+
 ### P2 — Should Do
 - [ ] 2.1 Verify: the 3 prose queries + 2 code queries return on-topic top hits via the shipped path
   (this is the verification task — system-level, not unit).
