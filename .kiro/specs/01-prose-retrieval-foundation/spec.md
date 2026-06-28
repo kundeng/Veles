@@ -247,8 +247,14 @@ transformer rerank (D9) helps content-bearing sentiment but is **not** the lever
   confirming the path is correct. Latency: 27 s first query (model→VRAM cold load), **3.3 s warm**
   (one-shot CLI reloads the index each call; the persistent MCP would be faster). Unit tests + clippy green.
   *(Candle spike cross-check, superseded path: same corpus, 36 s CPU / 1.15 s warm GPU, same reordering.)*
-- [ ] 2.2 Document install + usage (README/quick-start): the lean default + how to enable rerank by
-  pointing `--rerank-url` at LM Studio (`:1234`) / ollama (`:11434`) with an embedding model loaded.
+- [x] 2.2 **Quick-start written** — `docs/guides/search-quickstart.md`: the three lanes (regex/exact,
+  hybrid/code, rerank/prose), session-memory build, server setup, build instructions. Skill doc
+  (`bayeslearner-skills/skills/veles/SKILL.md`) also updated for `--rerank` + `--mode regex`.
+- [x] 2.4 **Exact-match lane = `--mode regex` (grep parity).** BM25 matched whole tokens (`fuck`≠`fucking`,
+  45% recall vs grep); added `search_regex` (case-insensitive substring/regex over raw chunk text, ranked
+  by match count). Verified **72/72 vs `grep -iE`, 0 missed**. CLI/MCP via `--mode regex` (alias `grep`).
+  This also **delivers the affect-mining lever** lexically: `--mode regex` on a marker lexicon ranks
+  angriest-first by marker density — the right tool for pure-affect queries embeddings can't do.
 - [-] 2.3 DROPPED (D9): "enable GPU rerank in-binary" is moot — the embeddings **server** owns the GPU.
   GPU enablement is now "run LM Studio/ollama with a GPU," not a veles build concern. The CUDA toolkit
   install / `--features cuda` path below is retired with the candle spike.
@@ -264,8 +270,11 @@ transformer rerank (D9) helps content-bearing sentiment but is **not** the lever
   server-side model choice, not a veles build choice).
 - [ ] 3.2 Cross-encoder `/rerank` (TEI/Infinity) as an optional higher-precision mode — breaks
   server-uniformity (not all servers expose it), so behind an explicit `--rerank-mode crossencoder`.
-- [ ] 3.3 Multi-server auto-detect: probe LM Studio (:1234) then ollama (:11434) so `--rerank` "just
-  works" without `--rerank-url` when a server is up.
+  **Deferred, not started — cannot verify without a running TEI/Infinity server** (ollama/LM Studio
+  have no `/rerank`); building it blind would be unverifiable. Pick up when such a server is available.
+- [x] 3.3 **Multi-server auto-detect DONE** — `HttpReranker::resolve` probes LM Studio (:1234) then
+  ollama (:11434), picks an embedding model from the server's `/models`, so `--rerank` works with no
+  flags. Verified: `--rerank` with nothing else found the running ollama and used mxbai-embed-large.
 
 ## Open Questions
 - [ ] If adopt-ck: does the project repo become "distill/memory layer over ck" (rename/reorg from the
