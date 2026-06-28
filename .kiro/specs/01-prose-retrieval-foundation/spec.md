@@ -60,14 +60,34 @@ exactly this (fastembed hybrid + CLI/MCP) and recommends adopting it as the engi
 
 ## Decisions
 
-### D1: Engine — adopt BeaconBay/ck vs extend veles  *(bake-off in progress)*
-**Choice:** PENDING the head-to-head bake-off (task 1.1). Leaning **adopt ck** per the research
-recommendation + benchmark (ck uses the same fastembed/bge-small that scored 0.58–0.78; it already
-has hybrid RRF + CLI + MCP, so adopting it removes the embedder-refactor work from veles).
-**Why:** the only gap ck has (req 6 distill/memory) is ours to build regardless of engine; adopting
-a maintained engine lets us spend effort on the differentiator (distill + failure-memory), not on
-re-implementing transformer embeddings in veles. Counter-weight: veles has symbol-nav + our distill
-+ coordinator. The bake-off decides on evidence, not vibes.
+### D1: Engine — extend veles. ck ELIMINATED.  *(resolved 2026-06-27)*
+**Choice:** **Extend veles.** BeaconBay/ck is eliminated.
+**Why (evidence, not vibes):**
+1. Owner's prior experience: ck is **slow at indexing**.
+2. ck uses **fastembed** — the same engine my benchmark measured at **~13 chunks/s on CPU**. ck
+   cannot be faster than its own embedding backend; it shares the exact bottleneck, so it offers no
+   speed advantage and its one differentiator (transformer embeddings) is something veles+fastembed
+   gets identically.
+3. ck **won't run on this box**: prebuilt needs GLIBC ≥2.38 (box has 2.35), no musl/static asset,
+   and the source build fails to compile here.
+   → Adopting ck buys nothing veles+fastembed doesn't, while losing veles' symbol-nav, distill, and
+   coordinator. Decision closed.
+
+### D5: The real crux is indexing SPEED, not the engine.  *(open — drives the design)*
+**Context:** Transformer embedding gives the relevance (D2), but at **~13 chunks/s on CPU** a full
+~41k-chunk index is ~50 min — the same slowness that eliminated ck. Swapping the model alone repeats
+that mistake. **The design must make transformer-grade results affordable on CPU.** Options to weigh
+(benchmark before choosing):
+- **(a) Two-stage retrieve→rerank** *(owner guidance point 2: "rerank")* — cheap recall (BM25 +
+  static potion, both instant to index) returns top-K; a transformer **reranks only those K at query
+  time** (bounded cost, cacheable). **No full-corpus transformer index** → indexing stays fast. Lead
+  candidate.
+- **(b) One-time transformer index** — embed the whole corpus once (~50 min), incremental after;
+  queries instant. Rejected-leaning: this is the slowness the owner already disliked.
+- **(c) Faster embedding** — int8-quantized ONNX (2–4×), smaller model, better batch/threading.
+  Complementary to (a).
+**Why this matters:** it converts "add a transformer" (which would re-create ck's slowness) into
+"keep fast indexing, spend transformer cost only on the handful of results that reach the user."
 
 ### D2: Transformer embedding is the relevance lever  *(proven)*
 **Choice:** Use a general-language CPU transformer embedding (bge-small now; evaluate nomic-embed for
@@ -95,14 +115,18 @@ atomic; prove the retrieval foundation first.
 <!-- [ ] pending | [x] done | [!] BLOCKED | [-] DROPPED: reason | [>] → spec_id -->
 
 ### P1 — Must Do
-- [ ] 1.1 **Engine bake-off** — build ck (in progress), index (a) the distilled transcript corpus and
-  (b) a real code repo; run the 3 benchmark queries + 2 code queries; compare relevance, ergonomics,
-  CLI/MCP surface, and index size/speed against veles+fastembed. **Record the verdict in D1.**
-- [ ] 1.2 **Stand up the chosen engine** over the distilled transcript corpus with a transformer
-  model (bge-small/nomic), hybrid RRF enabled. (Adopt-ck: index via ck. Extend-veles: implement the
-  `Embedder` enum {Static|Onnx} and a fastembed backend.)
-- [ ] 1.3 **CLI + MCP prose search** works end-to-end on the corpus, daemon-free from the CLI.
-- [ ] 1.4 Record the per-corpus embedding-model choice in the index manifest (transformer=prose).
+- [x] 1.1 **Engine bake-off — ck eliminated, extend veles.** Resolved by elimination (D1): ck is slow
+  at indexing (owner), shares fastembed's ~13 chunks/s bottleneck (no advantage), and won't run on
+  this box (GLIBC 2.35 < 2.38; source build fails). Evidence recorded in D1.
+- [ ] 1.2 **Benchmark the speed-vs-quality architectures (D5)** — measure, on the distilled corpus:
+  (a) two-stage BM25/static recall → transformer rerank top-K (query-time cost for K=20/50);
+  (b) int8-quantized bge-small index throughput vs fp32 (the 13 chunks/s baseline). Pick the
+  architecture in D5 from numbers. **This is the gating task — do before building.**
+- [ ] 1.3 **Implement the chosen architecture in veles.** Likely: `Embedder` enum {Static|Onnx}
+  fastembed backend used as a **reranker over top-K** (not a full-corpus index), preserving the fast
+  BM25/static index and the lexical RRF channel.
+- [ ] 1.4 **CLI + MCP prose search** end-to-end on the corpus, daemon-free from the CLI; per-corpus
+  model choice recorded in the index manifest.
 
 ### P2 — Should Do
 - [ ] 2.1 Verify: the 3 prose queries + 2 code queries return on-topic top hits via the shipped path
@@ -118,7 +142,11 @@ atomic; prove the retrieval foundation first.
 - [ ] sqlite-vec vs ck's built-in index for the (later) failure-memory store. (→ spec 02)
 
 ## Log
-**2026-06-27** — Spec created. Steering + data-architecture anchor + research + benchmark already
-committed. Transformer lever proven (D2). ck-cli building from source for the bake-off (1.1).
-Frame ratified from owner guidance without asking (owner away, loop mode).
+**2026-06-27** — Spec created. Steering + data-architecture anchor + research + benchmark committed.
+Transformer lever proven (D2).
+**2026-06-27** — Bake-off resolved by elimination: **ck out** (slow indexing per owner; same fastembed
+13 chunks/s bottleneck; won't run — GLIBC 2.35 < 2.38, source build fails). Engine = **extend veles**
+(D1). Key reframe (D5): the crux is **indexing speed**, not the engine — pivot the design to
+**two-stage retrieve→rerank** (fast index, transformer cost bounded to top-K) so we don't re-create
+ck's slowness. Task 1.1 done; 1.2 now the gating benchmark. Cleaned up all ck build processes/dirs.
 </content>
