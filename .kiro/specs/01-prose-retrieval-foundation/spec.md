@@ -73,21 +73,18 @@ exactly this (fastembed hybrid + CLI/MCP) and recommends adopting it as the engi
    → Adopting ck buys nothing veles+fastembed doesn't, while losing veles' symbol-nav, distill, and
    coordinator. Decision closed.
 
-### D5: The real crux is indexing SPEED, not the engine.  *(open — drives the design)*
-**Context:** Transformer embedding gives the relevance (D2), but at **~13 chunks/s on CPU** a full
-~41k-chunk index is ~50 min — the same slowness that eliminated ck. Swapping the model alone repeats
-that mistake. **The design must make transformer-grade results affordable on CPU.** Options to weigh
-(benchmark before choosing):
-- **(a) Two-stage retrieve→rerank** *(owner guidance point 2: "rerank")* — cheap recall (BM25 +
-  static potion, both instant to index) returns top-K; a transformer **reranks only those K at query
-  time** (bounded cost, cacheable). **No full-corpus transformer index** → indexing stays fast. Lead
-  candidate.
-- **(b) One-time transformer index** — embed the whole corpus once (~50 min), incremental after;
-  queries instant. Rejected-leaning: this is the slowness the owner already disliked.
-- **(c) Faster embedding** — int8-quantized ONNX (2–4×), smaller model, better batch/threading.
-  Complementary to (a).
-**Why this matters:** it converts "add a transformer" (which would re-create ck's slowness) into
-"keep fast indexing, spend transformer cost only on the handful of results that reach the user."
+### D5: Architecture = two-stage retrieve→rerank (fast index, bounded query cost).  *(resolved 2026-06-27)*
+**Context:** Transformer embedding gives the relevance (D2), but a full ~41k-chunk transformer index
+is ~50 min on CPU — the slowness that eliminated ck. **The design must make transformer-grade results
+affordable on CPU.**
+**Choice:** **(a) Two-stage retrieve→rerank.** Keep veles' fast BM25+static index (instant, no
+change); for a prose query, take the top-K candidates from that cheap recall and **rerank only those
+K with a transformer at query time**. No full-corpus transformer index.
+**Why (measured, task 1.2):** bge-small on CPU reranks **K=50 in 599 ms** (K=20: 204 ms; query embed:
+3 ms) — interactive latency, and indexing stays as fast as today. This spends transformer cost only
+on the handful of results that reach the user, exactly the owner's "fuse with RRF, then rerank"
+guidance. Rejected: (b) one-time full transformer index (~50 min — the slowness owner disliked).
+Complementary, later: (c) int8-quantized model to cut the 599 ms further / raise K.
 
 ### D2: Transformer embedding is the relevance lever  *(proven)*
 **Choice:** Use a general-language CPU transformer embedding (bge-small now; evaluate nomic-embed for
