@@ -160,4 +160,14 @@ Transformer lever proven (D2).
 (D1). Key reframe (D5): the crux is **indexing speed**, not the engine — pivot the design to
 **two-stage retrieve→rerank** (fast index, transformer cost bounded to top-K) so we don't re-create
 ck's slowness. Task 1.1 done; 1.2 now the gating benchmark. Cleaned up all ck build processes/dirs.
+**2026-06-27** — Owner offered local **RTX 5070 Ti** → D6: GPU-optional accelerator (CPU floor stays).
+**2026-06-27** — Task 1.2 measured: two-stage rerank latency = **K=50 in 599ms CPU** (D5 confirmed,
+viable). Ran a real BM25-recall→bge-rerank validation: the rerank **mechanism works** (reorders toward
+topical relevance), BUT every top chunk is still distill machinery (`toolUseResult.structuredPatch`,
+`message.content[...]`). **Empirical lesson: transformer rerank cannot overcome a noisy corpus —
+structured distill records are the DOMINANT quality lever, above the embedding model and GPU.** This
+elevates the structured-distill layer (→ spec 02) to the top quality priority; spec 01's retrieval
+architecture (two-stage rerank, GPU-optional) is sound but gated on clean records to actually shine.
+(Validation run also had a sampling artifact — sequential fill let one giant session dominate the
+2500-chunk slice; not corpus-representative, but the noise-ceiling conclusion holds.)
 </content>
