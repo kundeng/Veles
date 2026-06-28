@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use crate::chunker;
 use crate::index::dense::DenseIndex;
-use crate::index::search::{search_bm25, search_hybrid, search_semantic};
+use crate::index::search::{search_bm25, search_hybrid, search_regex, search_semantic};
 use crate::index::sparse::Bm25Index;
 use crate::model;
 use crate::persist::{self, FileFingerprint, Manifest, UpdateReport};
@@ -510,6 +510,9 @@ impl VelesIndex {
                 alpha,
                 selector.as_deref(),
             ),
+            SearchMode::Regex => {
+                search_regex(query, &self.chunks, top_k, selector.as_deref())
+            }
         }
     }
 

@@ -22,6 +22,10 @@ pub enum SearchMode {
     Semantic,
     /// BM25 only.
     Bm25,
+    /// Literal/regex substring match over raw chunk text — grep-grade exact
+    /// matching (case-insensitive). Catches morphological variants BM25 misses
+    /// (`fuck` → `fucking`); ranked by match count.
+    Regex,
 }
 
 impl SearchMode {
@@ -31,6 +35,7 @@ impl SearchMode {
             Self::Hybrid => "hybrid",
             Self::Semantic => "semantic",
             Self::Bm25 => "bm25",
+            Self::Regex => "regex",
         }
     }
 }
@@ -48,6 +53,7 @@ impl std::str::FromStr for SearchMode {
             "hybrid" => Ok(Self::Hybrid),
             "semantic" => Ok(Self::Semantic),
             "bm25" => Ok(Self::Bm25),
+            "regex" | "grep" => Ok(Self::Regex),
             other => Err(format!("Unknown search mode: {other:?}")),
         }
     }

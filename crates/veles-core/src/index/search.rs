@@ -132,6 +132,57 @@ pub fn search_bm25(
     finalize_pure_mode(scores, query, chunks, top_k, SearchMode::Bm25)
 }
 
+/// Literal/regex search over raw chunk text — **grep-grade exact matching** in
+/// the lexical lane.
+///
+/// BM25 matches whole *tokens*, so a query `fuck` never matches the token
+/// `fucking`. This mode instead substring/regex-matches the pattern against
+/// each chunk's raw `content` (case-insensitive), exactly like `grep -iE`: so
+/// `fuck` matches `fucking`/`fucked`, and `fuck|shit|wtf` matches any of them.
+/// No embeddings, no tokenisation — this is the lane semantics has nothing to
+/// do with. Chunks are ranked by **match count** (more hits = stronger signal,
+/// e.g. an angrier turn), then truncated to `top_k`.
+///
+/// The pattern is treated as a regex; if it doesn't compile it falls back to a
+/// case-insensitive literal, so a stray `(` or `*` still does something useful.
+pub fn search_regex(
+    pattern: &str,
+    chunks: &[Chunk],
+    top_k: usize,
+    selector: Option<&[usize]>,
+) -> Vec<SearchResult> {
+    if pattern.trim().is_empty() || chunks.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let re = match regex::Regex::new(&format!("(?i){pattern}")) {
+        Ok(r) => r,
+        Err(_) => match regex::Regex::new(&format!("(?i){}", regex::escape(pattern))) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        },
+    };
+
+    let scan = |idx: usize| -> Option<(usize, usize)> {
+        let n = re.find_iter(&chunks.get(idx)?.content).count();
+        (n > 0).then_some((idx, n))
+    };
+    let mut hits: Vec<(usize, usize)> = match selector {
+        Some(sel) => sel.iter().filter_map(|&i| scan(i)).collect(),
+        None => (0..chunks.len()).filter_map(scan).collect(),
+    };
+
+    // Most matches first; stable so equal-count chunks keep index order.
+    hits.sort_by(|a, b| b.1.cmp(&a.1));
+    hits.truncate(top_k);
+    hits.into_iter()
+        .map(|(idx, n)| SearchResult {
+            chunk: chunks[idx].clone(),
+            score: n as f64,
+            source: SearchMode::Regex,
+        })
+        .collect()
+}
+
 /// Tokenize a query for BM25 lookup.
 ///
 /// Bare-identifier queries skip sub-token splitting so `handle_refs` only

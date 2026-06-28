@@ -1104,7 +1104,8 @@ impl App {
     fn cycle_mode(&mut self, reverse: bool) {
         self.mode = if reverse {
             match self.mode {
-                SearchMode::Hybrid => SearchMode::Semantic,
+                SearchMode::Hybrid => SearchMode::Regex,
+                SearchMode::Regex => SearchMode::Semantic,
                 SearchMode::Semantic => SearchMode::Bm25,
                 SearchMode::Bm25 => SearchMode::Hybrid,
             }
@@ -1112,7 +1113,8 @@ impl App {
             match self.mode {
                 SearchMode::Hybrid => SearchMode::Bm25,
                 SearchMode::Bm25 => SearchMode::Semantic,
-                SearchMode::Semantic => SearchMode::Hybrid,
+                SearchMode::Semantic => SearchMode::Regex,
+                SearchMode::Regex => SearchMode::Hybrid,
             }
         };
         // Re-run with the new mode immediately.

@@ -1237,6 +1237,7 @@ fn mode_color(mode: SearchMode) -> Color {
         SearchMode::Hybrid => Color::Rgb(125, 207, 255),
         SearchMode::Bm25 => Color::Rgb(255, 200, 80),
         SearchMode::Semantic => Color::Rgb(200, 130, 255),
+        SearchMode::Regex => Color::Rgb(120, 255, 160),
     }
 }
 
@@ -1245,6 +1246,7 @@ fn mode_label(mode: SearchMode) -> &'static str {
         SearchMode::Hybrid => "hybrid",
         SearchMode::Bm25 => "bm25",
         SearchMode::Semantic => "semantic",
+        SearchMode::Regex => "regex",
     }
 }
 
