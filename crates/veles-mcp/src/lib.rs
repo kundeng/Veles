@@ -896,10 +896,16 @@ impl McpServer {
         // repos in the multi-repo read-set.
         let rerank = args["rerank"].as_bool().unwrap_or(false);
         let reranker = if rerank {
-            Some(veles_core::rerank::HttpReranker::from_env_or(
-                args["rerank_url"].as_str(),
-                args["rerank_model"].as_str(),
-            ))
+            Some(
+                veles_core::rerank::HttpReranker::resolve(
+                    args["rerank_url"].as_str(),
+                    args["rerank_model"].as_str(),
+                )
+                .map_err(|e| JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                })?,
+            )
         } else {
             None
         };

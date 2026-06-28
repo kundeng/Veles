@@ -55,10 +55,10 @@ pub fn handle_search(
     // Rerank delegates embedding to a local /v1/embeddings server; `None`
     // reranker degrades to plain `search`. Single core fn either way.
     let mut results = if rerank {
-        let reranker = veles_core::rerank::HttpReranker::from_env_or(
+        let reranker = veles_core::rerank::HttpReranker::resolve(
             rerank_url.as_deref(),
             rerank_model.as_deref(),
-        );
+        )?;
         eprintln!(
             "rerank: {} via {} (recall k={rerank_k})",
             reranker.model(),

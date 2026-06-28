@@ -85,9 +85,47 @@ impl HttpReranker {
     pub fn from_env_or(url: Option<&str>, model: Option<&str>) -> Self {
         let env_url = std::env::var("VELES_RERANK_URL").ok();
         let env_model = std::env::var("VELES_RERANK_MODEL").ok();
-        Self::new(
-            url.or(env_url.as_deref()),
-            model.or(env_model.as_deref()),
+        Self::new(url.or(env_url.as_deref()), model.or(env_model.as_deref()))
+    }
+
+    /// Known local servers to probe when no URL is given, in order.
+    const KNOWN_SERVERS: &'static [&'static str] = &[
+        "http://localhost:1234/v1/embeddings",  // LM Studio
+        "http://localhost:11434/v1/embeddings", // ollama
+    ];
+
+    /// Resolve with **auto-detection**: explicit arg → `$VELES_RERANK_URL` →
+    /// probe the known local servers (LM Studio :1234, then ollama :11434) and
+    /// use the first one that's actually up. When a server is auto-found and no
+    /// model is given, pick an embedding-looking model it advertises. Errors
+    /// with a clear message when nothing is reachable, so `--rerank` "just
+    /// works" if any server is running and fails loudly if none is.
+    pub fn resolve(url: Option<&str>, model: Option<&str>) -> Result<Self> {
+        let env_url = std::env::var("VELES_RERANK_URL").ok();
+        let env_model = std::env::var("VELES_RERANK_MODEL").ok();
+        let model = model.or(env_model.as_deref());
+
+        // Explicit / env URL wins — no probing.
+        if let Some(u) = url.or(env_url.as_deref()) {
+            return Ok(Self::new(Some(u), model));
+        }
+
+        // Auto-detect: short-timeout probe of each known server's /models.
+        let probe = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(600))
+            .build();
+        for endpoint in Self::KNOWN_SERVERS {
+            if let Some(models) = probe_models(&probe, endpoint) {
+                let picked = model
+                    .map(str::to_string)
+                    .or_else(|| pick_embedding_model(&models))
+                    .unwrap_or_else(|| DEFAULT_RERANK_MODEL.to_string());
+                return Ok(Self::new(Some(endpoint), Some(&picked)));
+            }
+        }
+        bail!(
+            "no embeddings server reachable at localhost:1234 (LM Studio) or :11434 (ollama). \
+             Start one with an embedding model loaded, or pass --rerank-url / $VELES_RERANK_URL."
         )
     }
 
@@ -158,6 +196,36 @@ impl HttpReranker {
         // Vectors are L2-normalised, so cosine == dot product.
         Ok(emb[1..].iter().map(|c| dot(q, c)).collect())
     }
+}
+
+/// GET the sibling `/models` of an embeddings endpoint; return the advertised
+/// model ids if the server is up (an empty Vec still means "reachable"), or
+/// `None` if it can't be reached.
+fn probe_models(agent: &ureq::Agent, embed_url: &str) -> Option<Vec<String>> {
+    let models_url = embed_url.strip_suffix("/embeddings").map(|b| format!("{b}/models"))?;
+    let resp = agent.get(&models_url).call().ok()?;
+    #[derive(serde::Deserialize)]
+    struct Models {
+        #[serde(default)]
+        data: Vec<Model>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Model {
+        id: String,
+    }
+    let parsed: Models = resp.into_json().ok()?;
+    Some(parsed.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Pick an embedding-looking model id from a server's advertised list.
+fn pick_embedding_model(ids: &[String]) -> Option<String> {
+    const HINTS: &[&str] = &["embed", "bge", "nomic", "gte", "e5", "minilm", "mxbai"];
+    ids.iter()
+        .find(|id| {
+            let l = id.to_lowercase();
+            HINTS.iter().any(|h| l.contains(h))
+        })
+        .cloned()
 }
 
 fn l2_normalize(v: &mut [f32]) {
