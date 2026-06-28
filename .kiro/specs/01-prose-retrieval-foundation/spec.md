@@ -113,6 +113,32 @@ gets speed+quality, the tool still runs CPU-only elsewhere. Does **not** revive 
 **Consequence:** the embedding backend must expose a CPU/CUDA execution-provider switch; index manifest
 records which model + provider produced the vectors (so a CPU reader never mis-reads a GPU-built index).
 
+### D7: jsonl cleaning = external-transform pipeline (config-as-code), NOT veles core.  *(2026-06-27)*
+**Context:** "How to clean jsonl without domain knowledge?" veles must stay format-blind.
+**Choice:** Use veles' **existing** `pipeline.rs` mechanism: a `veles.pipeline.json` stage declares
+`{source glob, transform: [program, args...]}`; veles runs `<transform> <abs-source>` and indexes the
+stdout. The domain-specific cleaning (structured failure records, turn-boundary chunking, dedup,
+metadata) lives in a **pluggable external command/extension** (python/DSL/any executable), wired in
+config. The built-in Rust value-shape noise filter stays as the generic floor for the no-config case.
+**Why:** matches owner's "run this extension / steps / pipeline / DSL as config-as-code"; keeps veles
+agnostic; the structured-record cleaner that gave **+43% P@5** (D8 numbers) is just a better transform
+script, no core change. **Measured:** prose-only cleaning lifted P@5 0.37→0.53, MRR 0.540→0.743.
+
+### D8: Transformer embedding policy — rerank on CPU always; full dense index only on GPU.  *(2026-06-27)*
+**Context:** Owner asked: "transformer only when GPU available, else CPU too slow — right or wrong?"
+**Measured numbers (bge-small, this box):**
+- **Full-corpus transformer index on CPU: ~12–40 chunks/s → ~41k chunks ≈ 20–57 min.** Too slow. ✓ owner.
+- **Transformer rerank of top-K=50 on CPU: 599 ms/query.** Fast. ✗ owner ("CPU too slow" is wrong here).
+- **Clean records (preprocessing): +43% P@5, GPU-independent — the biggest lever of all.**
+**Choice (owner half-right):**
+- **Always** use transformer as a **reranker over top-K** (BM25/static recall) — viable on CPU (0.6 s).
+- **Gate the full dense transformer index on GPU** (RTX embeds 41k in ~10–30 s) — there the owner is
+  right: don't full-index on CPU.
+- **Prioritize clean records first** — it beats the embed-everything-vs-rerank question and costs no GPU.
+**Net:** you don't need a GPU to get transformer-quality *results* (rerank delivers it on CPU); you need
+a GPU only to make *semantic first-stage recall* (full dense index) affordable. CPU floor = clean
+records + BM25/static recall + transformer rerank.
+
 ## Dev Environment (config-as-code — pointers only)
 <!-- Rule 18: read the real config, don't copy values here. -->
 - Engine source (if extend-veles): this repo (`crates/`), `cargo build --release -p veles-cli --features dashboard`.
