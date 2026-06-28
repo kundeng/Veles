@@ -162,6 +162,29 @@ floor). The candle/CUDA path is **shelved as a proven spike** (commit 3091708), 
 A cross-encoder `/rerank` (TEI/Infinity only) is a possible later precision upgrade but would break
 server-uniformity, so it's deferred. **D6/D8's CPU-vs-GPU embedding policy is moot** — the server owns that.
 
+### D10: Session-memory search = per-USER-turn granularity; pure-sentiment needs an AFFECT signal, not better embeddings.  *(2026-06-28)*
+**Context:** Owner's killer use case is finding a past session by **sentiment** ("where was I firefighting /
+exhausted / cursing"). Measured the corpus: a session is **81% agent output, 19% user** (1 user char per 4
+agent chars). Owner: "my comments are a thin layer; sometimes just 'ok go', other times frustrations /
+yearnings / curses."
+**Findings (empirical):**
+- Full-session 50-line chunks **bury** the user's sentiment line (1/5 of a chunk, diluted by agent prose).
+  Rerank cannot recover it → returned unrelated (bili2youtube) chunks for a "firefighting/burnout" query.
+- **Per-user-turn records** (one turn = one indexed unit; drop `<40-char` acks) make the sentiment line the
+  whole record. `pipelines/session_memory.py` builds this from raw jsonl (2.4k turns, 2 MB, index 0.47 s).
+- With per-turn + transformer rerank, **content-bearing** sentiment queries work: "frustrated, exhausted,
+  failures, bad builds" → the right session **#1 (0.624 vs 0.421)**.
+- **But pure-sentiment paraphrase still fails** ("overwhelmed and tired", "fragile and breaking") — general
+  embeddings match topic/words, not affect; generic words win. Static baseline is noise-floor (0.010) on
+  prose without lexical overlap (an earlier apparent baseline "win" was a BM25 fluke on the word "constantly").
+**Choice:** ship per-turn granularity now (`session_memory.py`) — it's the necessary substrate and a real win
+for content-bearing queries. **Affect is the next lever, not optional:** to retrieve by *feeling*, tag each
+user turn with an affect signal (cheap lexical curse/intensity first; small local LLM later) and rank on it,
+because embedding cosine demonstrably does not capture affect. (Owner chose "per-turn now, affect later" —
+the data says "later" should be soon.)
+**Consequence:** session-memory is a distinct corpus/mode from content search (D7 distill family). The
+transformer rerank (D9) helps content-bearing sentiment but is **not** the lever for pure-affect queries.
+
 ## Dev Environment (config-as-code — pointers only)
 <!-- Rule 18: read the real config, don't copy values here. -->
 - Engine source (if extend-veles): this repo (`crates/`), `cargo build --release -p veles-cli --features dashboard`.
