@@ -1,7 +1,7 @@
 //! Glue helpers shared between handlers — index loading, model loading,
 //! glob filters, git-URL detection.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 
@@ -40,10 +40,20 @@ pub fn open_index(
     }
 
     let path_buf = PathBuf::from(path);
-    if use_cache && persist::index_exists(&path_buf) {
-        match VelesIndex::load(&path_buf, model.clone()) {
+    // Resolve to the directory whose `.veles/` actually holds this folder's
+    // index — the same `index_root` the MCP server/coordinator read. For a
+    // verbose-JSON folder (e.g. agent transcripts) this transparently points us
+    // at the distilled shadow and makes it current, so a CLI-only
+    // `veles search <transcripts>` works with no daemon. A normal repo resolves
+    // to itself (no build here — the lazy paths below handle it). This is the
+    // one place CLI reads and MCP reads converge; the CLI has no distill logic
+    // of its own.
+    let resolved = veles_core::ingest::prepare_for_read(&path_buf, &model)?;
+
+    if use_cache && persist::index_exists(&resolved) {
+        match VelesIndex::load(&resolved, model.clone()) {
             Ok(idx) => {
-                tracing::info!("Loaded persisted index from {}/.veles", path_buf.display());
+                tracing::info!("Loaded persisted index from {}/.veles", resolved.display());
                 return Ok(idx);
             }
             Err(e) => {
@@ -54,7 +64,7 @@ pub fn open_index(
         }
     }
 
-    VelesIndex::from_path(Path::new(path), Some(model), None, include_text_files)
+    VelesIndex::from_path(&resolved, Some(model), None, include_text_files)
 }
 
 pub fn load_model(multilingual: bool) -> Result<model::StaticModel> {

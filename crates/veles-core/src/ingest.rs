@@ -153,6 +153,61 @@ pub fn establish_plan(folder: &Path) -> std::io::Result<Plan> {
     })
 }
 
+/// One-shot readiness for a **synchronous reader without a live coordinator**
+/// (the CLI, tests, any caller that just wants to read now).
+///
+/// Resolves `folder` to the directory whose `.veles/` holds its index — the
+/// same `index_root` the MCP server, coordinator, and dashboard read from — and
+/// for a verbose-JSON folder makes the distilled shadow current *before*
+/// returning, so a plain `veles search <transcripts>` works with no daemon.
+///
+/// Cost contract (this is why the CLI can call it on every read):
+/// - **Normal repo (`InPlace`)** — pure resolution, returns `folder`. No build
+///   here; the caller's own `open_index` builds/loads lazily as before.
+/// - **Verbose-JSON (`Distill`)** — delegates to
+///   [`crate::pipeline::run_distill_folder`], which is *cheap when nothing
+///   changed*: a stat-only scan of the sources that skips loading the index
+///   entirely (see commit history — the coordinator's per-tick reload that
+///   pegged RSS was fixed there, and this shares that fast path). A genuine
+///   change re-derives only the changed sessions; a first run builds once.
+/// - **A coordinator already owns the shadow** (writer lock Held) — it is
+///   keeping the index fresh, so we don't fight for the lock: return the shadow
+///   dir and read what it has committed.
+///
+/// This is the single shared resolver that keeps the CLI and the MCP server in
+/// agreement: both read `index_root`, and a `Distill` folder is derived by the
+/// *same* code on both paths. The CLI grows no distill logic of its own.
+pub fn prepare_for_read(
+    folder: &Path,
+    model: &crate::model::StaticModel,
+) -> anyhow::Result<PathBuf> {
+    let plan = establish_plan(folder)?;
+    let dest = match plan.mode {
+        IngestMode::InPlace => return Ok(plan.index_root),
+        IngestMode::Distill => plan
+            .derived_dir
+            .clone()
+            .unwrap_or_else(|| plan.index_root.clone()),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Sole-writer on the shadow root (never the source). If a coordinator (or a
+    // concurrent CLI) already holds it, trust its committed index and just read.
+    match crate::lock::try_acquire(&dest, "distill-oneshot", now)? {
+        crate::lock::LockOutcome::Acquired(_guard) => {
+            // _guard is a named binding (not bare `_`), so the lock is held for
+            // the whole derive+index below and released on return.
+            crate::pipeline::run_distill_folder(&plan.source, &dest, model, now)?;
+        }
+        crate::lock::LockOutcome::Held { .. } => {}
+    }
+    Ok(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

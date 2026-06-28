@@ -117,6 +117,45 @@ pub fn handle_index(
     if !path_buf.is_dir() {
         bail!("Path is not a directory: {path}");
     }
+
+    // A verbose-JSON corpus (agent transcripts, exports) is distilled into a
+    // veles-owned shadow and the shadow is indexed — the source is never
+    // written. Same plan + same one-shot builder the coordinator uses; `index`
+    // just runs it synchronously. A normal repo (derived_dir is None) falls
+    // through to the in-place build below, unchanged.
+    let plan = veles_core::ingest::establish_plan(&path_buf)?;
+    if let Some(dest) = plan.derived_dir.clone() {
+        let _writer = acquire_writer(&dest, "veles index")?;
+        if persist::index_exists(&dest) && !force {
+            eprintln!(
+                "Index already exists at {}/.veles (distilled from {}). Use `veles update {path}` to refresh, or `--force` to rebuild.",
+                dest.display(),
+                plan.source.display()
+            );
+            std::process::exit(1);
+        }
+        if force {
+            persist::clean(&dest).ok();
+        }
+        let mdl = load_model(multilingual)?;
+        eprintln!(
+            "Distilling {} → {} ...",
+            plan.source.display(),
+            dest.display()
+        );
+        let started = std::time::Instant::now();
+        let rpt = veles_core::pipeline::run_distill_folder(&plan.source, &dest, &mdl, epoch_secs())?;
+        let build_secs = started.elapsed().as_secs_f64();
+        println!(
+            "Indexed {} distilled file(s) / {} chunks from {} source(s) in {build_secs:.2}s — saved to {}/.veles",
+            rpt.indexed_files,
+            rpt.total_chunks,
+            rpt.sources_seen,
+            dest.display()
+        );
+        return Ok(());
+    }
+
     let _writer = acquire_writer(&path_buf, "veles index")?;
 
     if persist::index_exists(&path_buf) && !force {
@@ -149,6 +188,34 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     if !path_buf.is_dir() {
         bail!("Path is not a directory: {path}");
     }
+
+    // Verbose-JSON corpus: re-derive only the sessions that changed and update
+    // the shadow index in place (same one-shot builder as `index`). The source
+    // tree is never written.
+    let plan = veles_core::ingest::establish_plan(&path_buf)?;
+    if let Some(dest) = plan.derived_dir.clone() {
+        let _writer = acquire_writer(&dest, "veles update")?;
+        if !persist::index_exists(&dest) {
+            bail!(
+                "No distilled index at {}/.veles. Run `veles index {path}` first.",
+                dest.display()
+            );
+        }
+        let mdl = load_model(multilingual)?;
+        let started = std::time::Instant::now();
+        let rpt = veles_core::pipeline::run_distill_folder(&plan.source, &dest, &mdl, epoch_secs())?;
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "Updated distilled index in {secs:.2}s — {} source(s), +{} derived, -{} removed → {} files / {} chunks",
+            rpt.sources_seen,
+            rpt.derived_written,
+            rpt.derived_removed,
+            rpt.indexed_files,
+            rpt.total_chunks
+        );
+        return Ok(());
+    }
+
     let _writer = acquire_writer(&path_buf, "veles update")?;
     if !persist::index_exists(&path_buf) {
         bail!(
@@ -193,11 +260,15 @@ pub fn handle_update(path: String, multilingual: bool) -> Result<()> {
     Ok(())
 }
 
-fn acquire_writer(path: &std::path::Path, label: &str) -> Result<veles_core::lock::WriterLock> {
-    let now = std::time::SystemTime::now()
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn acquire_writer(path: &std::path::Path, label: &str) -> Result<veles_core::lock::WriterLock> {
+    let now = epoch_secs();
     match veles_core::lock::try_acquire(path, label, now)? {
         veles_core::lock::LockOutcome::Acquired(writer) => Ok(writer),
         veles_core::lock::LockOutcome::Held { holder } => {
@@ -276,7 +347,9 @@ pub fn handle_add(folder: String, repo: String) -> Result<()> {
 }
 
 pub fn handle_status(path: String) -> Result<()> {
-    let path_buf = PathBuf::from(&path);
+    // For a verbose-JSON folder this resolves to the distilled shadow whose
+    // `.veles/` actually holds the index; a normal repo resolves to itself.
+    let path_buf = veles_core::ingest::index_root(&PathBuf::from(&path));
     if !persist::index_exists(&path_buf) {
         println!("No index found at {}/.veles", path_buf.display());
         return Ok(());
@@ -363,7 +436,9 @@ pub fn handle_status(path: String) -> Result<()> {
 }
 
 pub fn handle_clean(path: String) -> Result<()> {
-    let path_buf = PathBuf::from(&path);
+    // Clean the index that actually exists for this folder — the distilled
+    // shadow for a verbose-JSON folder, the repo itself otherwise.
+    let path_buf = veles_core::ingest::index_root(&PathBuf::from(&path));
     if !persist::index_exists(&path_buf) {
         println!("No index to remove at {}/.veles", path_buf.display());
         return Ok(());
