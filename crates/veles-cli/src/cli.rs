@@ -82,15 +82,25 @@ pub enum Commands {
         /// Force a fresh in-memory build, ignoring any `.veles/` cache.
         #[arg(long)]
         no_cache: bool,
-        /// Re-rank the recall set with a transformer (bge-small-en-v1.5) for a
-        /// precision boost. Requires a build with `--features rerank`; auto-uses
-        /// the GPU when present.
+        /// Re-rank the recall set with a transformer for a precision boost.
+        /// Delegates embedding to a local OpenAI-compatible /v1/embeddings
+        /// server (LM Studio, ollama, TEI) — see --rerank-url/--rerank-model.
+        /// The server must be running with an embedding model loaded.
         #[arg(long)]
         rerank: bool,
         /// Recall depth feeding the reranker (how many candidates the cheap
         /// stage pulls before re-scoring). Only used with `--rerank`.
         #[arg(long, default_value = "50")]
         rerank_k: usize,
+        /// OpenAI-compatible /v1/embeddings endpoint for `--rerank`
+        /// (default: LM Studio http://localhost:1234/v1/embeddings; ollama is
+        /// http://localhost:11434/v1/embeddings). Also reads $VELES_RERANK_URL.
+        #[arg(long)]
+        rerank_url: Option<String>,
+        /// Embedding model the rerank server should use (must be loaded there;
+        /// default `nomic-embed-text`). Also reads $VELES_RERANK_MODEL.
+        #[arg(long)]
+        rerank_model: Option<String>,
     },
 
     /// Find code similar to a specific location.

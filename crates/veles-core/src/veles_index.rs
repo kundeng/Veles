@@ -524,7 +524,6 @@ impl VelesIndex {
     /// server (`rerank` arg) call — there is no surface-specific search logic.
     /// A `None` reranker degrades to plain `search` truncated to `top_k`, so the
     /// flag can be threaded through unconditionally.
-    #[cfg(feature = "rerank")]
     #[allow(clippy::too_many_arguments)]
     pub fn search_with_rerank(
         &self,
@@ -535,7 +534,7 @@ impl VelesIndex {
         alpha: Option<f64>,
         filter_languages: Option<&[String]>,
         filter_paths: Option<&[String]>,
-        reranker: Option<&crate::rerank::Reranker>,
+        reranker: Option<&crate::rerank::HttpReranker>,
     ) -> anyhow::Result<Vec<SearchResult>> {
         // Recall stage: never pull fewer than we intend to return.
         let recall = k_recall.max(top_k);

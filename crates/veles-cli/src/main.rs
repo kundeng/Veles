@@ -68,6 +68,8 @@ async fn main() {
             no_cache,
             rerank,
             rerank_k,
+            rerank_url,
+            rerank_model,
         }) => handlers::handle_search(
             query,
             path,
@@ -82,6 +84,8 @@ async fn main() {
             no_cache,
             rerank,
             rerank_k,
+            rerank_url,
+            rerank_model,
         ),
 
         Some(Commands::FindRelated {

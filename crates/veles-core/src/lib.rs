@@ -109,8 +109,7 @@ pub mod model;
 pub mod persist;
 pub mod pipeline;
 pub mod ranking;
-/// Optional transformer reranker — only built with `--features rerank`.
-#[cfg(feature = "rerank")]
+/// Transformer reranker that delegates embedding to a local /v1/embeddings server.
 pub mod rerank;
 pub mod runtime;
 pub mod scope;

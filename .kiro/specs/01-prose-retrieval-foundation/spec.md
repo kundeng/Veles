@@ -139,6 +139,29 @@ script, no core change. **Measured:** prose-only cleaning lifted P@5 0.37→0.53
 a GPU only to make *semantic first-stage recall* (full dense index) affordable. CPU floor = clean
 records + BM25/static recall + transformer rerank.
 
+### D9: Embeddings are DELEGATED to a local /v1/embeddings server, not bundled.  *(2026-06-28, supersedes the in-binary-embedding premise of D5/D6/D8)*
+**Context:** The candle-CUDA spike worked (rerank 36 s CPU → **1.15 s warm GPU**, verified e2e on the
+RTX 5070 Ti via an ephemeral container build), but shipping it means **bundling ~855 MB of CUDA** with
+the binary — the host driver `libcuda.so.1` can never be bundled anyway (true for *all* GPU software),
+so a "single self-contained GPU binary" is impossible regardless. Owner pushback: "I hardly see the
+benefit when something has to be bundled… assume LM Studio / ollama and use them."
+**Choice:** veles delegates the transformer embed/rerank to a **local OpenAI-compatible
+`/v1/embeddings` server** (LM Studio, ollama, HuggingFace TEI, Infinity, llama.cpp-server). veles ships
+the **bi-encoder rerank** as a tiny `ureq` HTTP client (`HttpReranker`): embed query + top-K candidates,
+rank by cosine — uses only `/v1/embeddings`, so it is **server-agnostic** (one client, every server).
+The GPU/runtime lives in the server (its Vulkan/CUDA/Metal). veles stays a **lean 21 MB single binary**
+(was 65 MB with candle); no candle, no cudarc, no bundled CUDA, no glibc landmines.
+**Why:** (1) the hard-to-find part (in-binary transformer GPU) is someone else's solved problem; (2)
+cross-vendor GPU for free; (3) keeps the single-binary/CPU-floor north star intact; (4) lift-vs-fork
+re-survey (2026-06-28) confirmed **no project dominates the Veles fork** under this relaxation — closest
+is **Codanna** (Rust, single binary, already does `/v1/embeddings` delegation) but it lacks fused hybrid
+*and* a distill pipeline (our moat). **Default** `http://localhost:1234/v1/embeddings` (LM Studio),
+model `nomic-embed-text`; override via `--rerank-url`/`--rerank-model` or `$VELES_RERANK_*`.
+**Consequence:** rerank needs a running embeddings server (the static/BM25 hybrid is the no-server CPU
+floor). The candle/CUDA path is **shelved as a proven spike** (commit 3091708), not the shipped path.
+A cross-encoder `/rerank` (TEI/Infinity only) is a possible later precision upgrade but would break
+server-uniformity, so it's deferred. **D6/D8's CPU-vs-GPU embedding policy is moot** — the server owns that.
+
 ## Dev Environment (config-as-code — pointers only)
 <!-- Rule 18: read the real config, don't copy values here. -->
 - Engine source (if extend-veles): this repo (`crates/`), `cargo build --release -p veles-cli --features dashboard`.
@@ -170,7 +193,20 @@ records + BM25/static recall + transformer rerank.
     if present, else degrades to plain `search` truncated to `top_k`.
 - [x] 1.4 **Wire CLI + MCP to the same core fn (no dual path).** CLI `--rerank`/`--rerank-k` → the core
   fn (handlers.rs); MCP `search` gained a `rerank` arg → the **same** fn (single + multi-repo paths).
-  Default off; feature-gated; `--features rerank` (and `cuda`) plumbed through veles-cli → core + mcp.
+  *(Candle build was feature-gated; D9 dropped the feature — rerank is now always-on via HTTP.)*
+
+> **NOTE (D9, 2026-06-28):** tasks 1.3 + 1.4 above were the **candle/CUDA spike** — built, GPU-verified
+> (36 s CPU → **1.15 s warm GPU**), then **shelved** (commit 3091708). Bundling ~855 MB of CUDA defeats
+> the single-binary goal, so the *shipped* reranker delegates embeddings over HTTP (task 1.6). The spike
+> stands as proof the transformer lever is worth ~1 s/query on a real GPU.
+
+- [x] 1.6 **Shipped reranker = HTTP delegation to a local /v1/embeddings server (D9).** Replaced the
+  candle `Reranker` with `HttpReranker` (`ureq`, ~no binary cost): embeds query + top-K candidates via
+  `POST /v1/embeddings`, ranks by cosine — **server-agnostic** (LM Studio / ollama / TEI / Infinity, one
+  client). Same core fn `search_with_rerank`; `--rerank-url`/`--rerank-model` (+ `$VELES_RERANK_*`) on CLI
+  and MCP; no cargo feature (always available). **Binary back to 21 MB, zero CUDA linkage.** clippy clean;
+  unit tests (`cosine_of_normalised_vectors`, `empty_candidates_is_empty`) pass. e2e against a live server
+  = task 2.1.
 
 - [x] 1.5 **Structured-record cleaner built + wired (the +43% lever).** `pipelines/session_distill.py`
   (external transform per D7) + `pipelines/veles.pipeline.json`. Keeps user/assistant prose, brief
@@ -180,27 +216,33 @@ records + BM25/static recall + transformer rerank.
   stays format-blind. Static scores stay ~0.009 (expected — needs the transformer to realize the gain).
 
 ### P2 — Should Do
-- [x] 2.1 **Verified e2e on the clean 229-session corpus** via the shipped `veles search --rerank`
-  path (release binary, `--features rerank`). 3 prose queries return on-topic top hits and the
-  transformer **visibly reorders** the static recall set (e.g. "UI said approved but nothing happened"
-  promoted `splunk-agentic-workbench/4ba73eca…` to #1; "veles distill jsonl…" surfaced two
-  `bayeslearner-skills` veles/distill chunks). Unit tests `embed_smoke` (384-dim unit vector) +
-  `rerank_orders_by_relevance` pass. Default build verified candle-free.
-  **Latency finding (corrects 1.2's 599ms):** the candle pure-Rust **f32 CPU** path costs
-  **k=10 → 8.2 s, k=50 → 36 s** per query on 16 cores (≈0.7 s/candidate at ~512 tokens, ~1 GB RSS,
-  linear in k). The 599 ms in 1.2 was a Python/onnx measurement, not this engine. **CPU rerank is
-  impractical → confirms D5/D6: transformer rerank is a GPU-only accelerator; static/BM25 is the CPU floor.**
-- [ ] 2.2 Document install + usage (README/quick-start) for the chosen engine path.
-- [ ] 2.3 **Enable the GPU rerank path.** Code is wired (`Device::cuda_if_available`, `--features cuda`),
-  but this box has the GPU (RTX 5070 Ti, 16 GB) **without the CUDA toolkit** (no `nvcc`/`libcudart`),
-  so `--features cuda` can't compile candle kernels. Blackwell (sm_120) needs CUDA **12.8+** — the
-  distro `nvidia-cuda-toolkit` is too old. Install the matching toolkit, then `cargo build
-  --features cuda` and re-measure (expect <100 ms for the same 1.7 TFLOP). Owner action (sudo).
+- [x] 2.1 **e2e VERIFIED via the shipped HTTP path.** Live run on the clean 229-session corpus:
+  lean 21 MB `veles search --rerank` → `POST http://localhost:11434/v1/embeddings` → **ollama running
+  nomic-embed-text on the RTX 5070 Ti GPU** (ollama self-detected CUDA compute=12.0, brought its own
+  runtime — no toolkit/host install). 3 prose queries return on-topic hits and the transformer **reorders
+  the static recall set identically to the candle spike** (e.g. "UI said approved…" → `4ba73eca` to #1),
+  confirming the path is correct. Latency: 27 s first query (model→VRAM cold load), **3.3 s warm**
+  (one-shot CLI reloads the index each call; the persistent MCP would be faster). Unit tests + clippy green.
+  *(Candle spike cross-check, superseded path: same corpus, 36 s CPU / 1.15 s warm GPU, same reordering.)*
+- [ ] 2.2 Document install + usage (README/quick-start): the lean default + how to enable rerank by
+  pointing `--rerank-url` at LM Studio (`:1234`) / ollama (`:11434`) with an embedding model loaded.
+- [-] 2.3 DROPPED (D9): "enable GPU rerank in-binary" is moot — the embeddings **server** owns the GPU.
+  GPU enablement is now "run LM Studio/ollama with a GPU," not a veles build concern. The CUDA toolkit
+  install / `--features cuda` path below is retired with the candle spike.
+  <details><summary>retired candle-GPU note</summary>
+  Code was wired (`Device::cuda_if_available`, `--features cuda`); this box's GPU (RTX 5070 Ti) had no
+  CUDA toolkit, so it was built+run via an ephemeral `nvidia/cuda:12.8-devel` container (nvcc) + host
+  PyTorch cu12 libs at runtime — proving 1.15 s warm. Superseded by D9; kept only as the latency proof.
+  Original note: install the matching toolkit, then `cargo build --features cuda` and re-measure. Owner action (sudo).
+  </details>
 
 ### P3 — Nice to Have
-- [ ] 3.1 nomic-embed-text vs bge-small comparison for long (8k-ctx) chunks on this corpus.
-- [ ] 3.2 If CPU rerank must be usable without a GPU: candle BLAS (`mkl`/`accelerate`) or int8 quant —
-  weigh against the single-binary/no-external-dep portability goal (the reason candle beat onnxruntime).
+- [ ] 3.1 nomic-embed-text vs bge-small comparison for long (8k-ctx) chunks on this corpus (now a
+  server-side model choice, not a veles build choice).
+- [ ] 3.2 Cross-encoder `/rerank` (TEI/Infinity) as an optional higher-precision mode — breaks
+  server-uniformity (not all servers expose it), so behind an explicit `--rerank-mode crossencoder`.
+- [ ] 3.3 Multi-server auto-detect: probe LM Studio (:1234) then ollama (:11434) so `--rerank` "just
+  works" without `--rerank-url` when a server is up.
 
 ## Open Questions
 - [ ] If adopt-ck: does the project repo become "distill/memory layer over ck" (rename/reorg from the

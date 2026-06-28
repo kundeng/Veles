@@ -37,6 +37,8 @@ pub fn handle_search(
     no_cache: bool,
     rerank: bool,
     rerank_k: usize,
+    rerank_url: Option<String>,
+    rerank_model: Option<String>,
 ) -> Result<()> {
     let format = resolve_format(&format_str)?;
     // Index contents (code-only vs +text) are an index-time decision owned by
@@ -50,37 +52,28 @@ pub fn handle_search(
     let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
     let path_slice: Option<&[String]> = glob_paths.as_deref();
 
-    // Both branches yield the same `Vec<SearchResult>` — the rerank branch just
-    // routes through the two-stage core fn. The `#[cfg]` is a thin compile gate,
-    // not a second search implementation.
+    // Rerank delegates embedding to a local /v1/embeddings server; `None`
+    // reranker degrades to plain `search`. Single core fn either way.
     let mut results = if rerank {
-        #[cfg(feature = "rerank")]
-        {
-            let reranker = veles_core::rerank::Reranker::load(None)
-                .context("load transformer reranker (bge-small-en-v1.5)")?;
-            eprintln!(
-                "rerank: bge-small-en-v1.5 on {} (recall k={rerank_k})",
-                if reranker.on_gpu() { "GPU" } else { "CPU" }
-            );
-            index.search_with_rerank(
-                &query,
-                top_k,
-                rerank_k,
-                search_mode,
-                None,
-                lang_slice,
-                path_slice,
-                Some(&reranker),
-            )?
-        }
-        #[cfg(not(feature = "rerank"))]
-        {
-            let _ = rerank_k;
-            bail!(
-                "this `veles` was built without rerank support — rebuild with \
-                 `cargo build --features rerank` (or `--features cuda` for GPU)"
-            );
-        }
+        let reranker = veles_core::rerank::HttpReranker::from_env_or(
+            rerank_url.as_deref(),
+            rerank_model.as_deref(),
+        );
+        eprintln!(
+            "rerank: {} via {} (recall k={rerank_k})",
+            reranker.model(),
+            reranker.endpoint()
+        );
+        index.search_with_rerank(
+            &query,
+            top_k,
+            rerank_k,
+            search_mode,
+            None,
+            lang_slice,
+            path_slice,
+            Some(&reranker),
+        )?
     } else {
         index.search(&query, top_k, search_mode, None, lang_slice, path_slice)
     };

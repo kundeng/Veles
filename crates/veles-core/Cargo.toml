@@ -26,20 +26,11 @@ ahash = { version = "0.8", features = ["serde"] }
 dashmap = { workspace = true }
 bincode = { workspace = true }
 
-# Optional transformer reranker (D5/D8): pure-Rust candle so the single binary
-# stays portable — no onnxruntime, no glibc 2.38 dependency (the box is 2.35).
-candle-core = { version = "0.11", optional = true }
-candle-nn = { version = "0.11", optional = true }
-candle-transformers = { version = "0.11", optional = true }
-tokenizers = { version = "0.21", optional = true }
-hf-hub = { version = "0.4", optional = true }
-
-[features]
-default = []
-# Two-stage retrieve→rerank: BM25/static recall top-K, BERT cross/bi-encoder rerank.
-rerank = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
-# Auto-GPU: rerank on CUDA when a device is present (Device::cuda_if_available).
-cuda = ["rerank", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Transformer rerank is DELEGATED to a local OpenAI-compatible /v1/embeddings
+# server (LM Studio, ollama, TEI, …) over HTTP — the GPU/runtime lives there, so
+# veles stays a lean single binary. `ureq` is a tiny pure-Rust blocking client
+# (already in the dep tree); no candle, no onnxruntime, no bundled CUDA.
+ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
