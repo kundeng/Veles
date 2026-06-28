@@ -99,6 +99,20 @@ failure recall (error codes, stack frames) must not be smeared by dense vectors.
 (borrowing engram's FTS5+transformer+RRF+temporal-decay design) is spec 02. **Why:** keep the sprint
 atomic; prove the retrieval foundation first.
 
+### D6: GPU is an optional accelerator, never required.  *(2026-06-27)*
+**Context:** Owner has a local **RTX 5070 Ti (16 GB)** and asked if GPU changes the design.
+**Choice:** **GPU-optional.** CPU stays the portable floor (D5 two-stage rerank). GPU plugs in via the
+**execution provider** (ONNX CUDA EP / candle CUDA) under the same `Embedder` abstraction — no
+architecture change. When a GPU is present, unlock a "**full dense transformer index + bigger model**"
+fast path (e.g. nomic-embed / Qwen3-Embedding-0.6B): GPU embeds the whole ~41k-chunk corpus in
+~10–30 s, so first-stage recall can be semantic too, not just BM25/static.
+**Why:** GPU changes the *ceiling* (index everything densely, bigger models), not the *architecture*.
+It does NOT change the highest-leverage work (distill/structured records — GPU-independent), the need
+for the lexical channel (exact-token recall), or shippability. GPU-optional dominates: owner's box
+gets speed+quality, the tool still runs CPU-only elsewhere. Does **not** revive ck (GLIBC, unrelated).
+**Consequence:** the embedding backend must expose a CPU/CUDA execution-provider switch; index manifest
+records which model + provider produced the vectors (so a CPU reader never mis-reads a GPU-built index).
+
 ## Dev Environment (config-as-code — pointers only)
 <!-- Rule 18: read the real config, don't copy values here. -->
 - Engine source (if extend-veles): this repo (`crates/`), `cargo build --release -p veles-cli --features dashboard`.
